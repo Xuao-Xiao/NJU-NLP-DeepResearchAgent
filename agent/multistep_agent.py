@@ -9,20 +9,27 @@ from .tools import build_searcher, get_agent_tool_specs_and_registry
 from .vllm_client import VLLMClient
 
 
-TOOL_DECISION_SYSTEM_PROMPT = """You are a Deep Research Agent working over a fixed offline document corpus.
+ACTION_DECISION_SYSTEM_PROMPT = """You are a Deep Research Agent working over a fixed offline document corpus.
 
-Your job is to answer the user's question by iteratively using tools and tracking evidence.
+You must plan the next action using only the provided state and evidence.
+
+Available actions:
+- search: use a rewritten query to search for better evidence
+- get_document: open one promising document by docid for verification
+- finish: stop tool use because current evidence is enough or no better next step exists
 
 Rules:
-- You may use only the provided tools.
-- Do not guess when evidence is weak.
-- If the current evidence is insufficient, call a tool instead of answering.
-- Prefer search(query) when you still need candidate documents or a better angle.
-- Prefer get_document(docid) when a retrieved document looks highly relevant and needs verification.
-- Avoid repeating the same query or reopening the same document unless absolutely necessary.
-- Use at most one tool call in each round.
-- Stop searching only when you have enough evidence for a final answer, or when no useful next step remains.
-- When you are ready to finish, do not call any tool. Instead output a short final note that states you are ready to answer.
+- Do not answer the user's question directly in this step.
+- Do not output chain-of-thought or <think>.
+- Output exactly one JSON object and nothing else.
+- Prefer get_document when promising docids are already available.
+- Prefer search when the current search results are weak or missing key entities.
+- Avoid repeating a previous query or reopening a document already opened.
+
+Use one of these JSON formats exactly:
+{"action":"search","query":"...","reason":"..."}
+{"action":"get_document","docid":"...","reason":"..."}
+{"action":"finish","answer_hint":"...","reason":"..."}
 """
 
 
@@ -79,6 +86,20 @@ def _safe_json_loads(raw_text: Any) -> Dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _extract_json_object(raw_text: str) -> Dict[str, Any]:
+    cleaned = _clean_text(raw_text).strip()
+    parsed = _safe_json_loads(cleaned)
+    if parsed:
+        return parsed
+
+    candidates = re.findall(r"\{.*?\}", cleaned, flags=re.DOTALL)
+    for candidate in candidates:
+        parsed = _safe_json_loads(candidate)
+        if parsed:
+            return parsed
+    return {}
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
@@ -189,8 +210,8 @@ def _build_round_user_prompt(
             recent_observation or "None",
             "",
             "Decide the single best next step.",
-            "If evidence is insufficient, call exactly one tool.",
-            "If evidence is sufficient, do not call tools and say you are ready to answer.",
+            "Return only one JSON object.",
+            "Do not answer the question yet.",
         ]
     )
 
@@ -227,6 +248,7 @@ def _init_state(question: str) -> Dict[str, Any]:
         "search_history": [],
         "opened_docids": [],
         "seen_docids": [],
+        "last_search_results": [],
         "confirmed_facts": [],
         "pending_subquestions": ["Resolve the key entity/relation chain needed by the question."],
         "candidate_answers": [],
@@ -253,6 +275,7 @@ def _update_state_from_tool(
     if tool_name == "search":
         query = str(tool_args.get("query", "")).strip()
         state["last_action"] = f"search:{query}"
+        state["last_search_results"] = tool_result if isinstance(tool_result, list) else []
         summaries = _summarize_search_result(tool_result)
         if summaries:
             state["confirmed_facts"].extend(summaries)
@@ -292,6 +315,111 @@ def _register_finish_signal(state: Dict[str, Any], raw_content: str) -> None:
         state["candidate_answers"].append(cleaned[:300])
     state["candidate_answers"] = state["candidate_answers"][-6:]
     state["finish_reason"] = "model_declared_ready"
+
+
+def _heuristic_query_from_question(question: str) -> str:
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’-]*", question)
+    filtered = []
+    stopwords = {
+        "the", "a", "an", "of", "and", "or", "to", "in", "on", "for", "from",
+        "with", "that", "this", "was", "were", "is", "are", "be", "by", "as",
+        "at", "it", "who", "what", "which", "when", "where", "their", "they",
+    }
+    for word in words:
+        lowered = word.lower()
+        if lowered not in stopwords and lowered not in filtered:
+            filtered.append(lowered)
+        if len(filtered) >= 12:
+            break
+    return " ".join(filtered) or question[:120]
+
+
+def _pick_unopened_docid(state: Dict[str, Any]) -> str:
+    for item in state.get("last_search_results", []):
+        docid = str(item.get("docid", "")).strip()
+        if docid and docid not in state["opened_docids"]:
+            return docid
+    return ""
+
+
+def _decide_next_action(
+    question: str,
+    state: Dict[str, Any],
+    client: VLLMClient,
+    model_name: str,
+    max_rounds: int,
+    round_id: int,
+    decision_max_tokens: int,
+    recent_observation: str,
+) -> Tuple[Dict[str, Any], str]:
+    state_summary = _build_state_summary(state)
+    round_messages = [
+        {"role": "system", "content": ACTION_DECISION_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": _build_round_user_prompt(
+                question=question,
+                state_summary=state_summary,
+                recent_observation=recent_observation,
+                max_rounds=max_rounds,
+                round_id=round_id,
+            ),
+        },
+    ]
+    response = client.simple_chat(
+        model=model_name,
+        messages=round_messages,
+        temperature=0.0,
+        max_tokens=decision_max_tokens,
+    )
+    raw_content = str(response["choices"][0]["message"].get("content", "") or "")
+    action = _extract_json_object(raw_content)
+    if action.get("action") in {"search", "get_document", "finish"}:
+        return action, raw_content
+
+    fallback_docid = _pick_unopened_docid(state)
+    if fallback_docid:
+        return {
+            "action": "get_document",
+            "docid": fallback_docid,
+            "reason": "Fallback because action JSON was invalid; open the top unseen candidate document.",
+        }, raw_content
+
+    fallback_query = _heuristic_query_from_question(question)
+    previous = {_normalize_query(item) for item in state["search_history"]}
+    if _normalize_query(fallback_query) not in previous:
+        return {
+            "action": "search",
+            "query": fallback_query,
+            "reason": "Fallback because action JSON was invalid; perform a keyword search.",
+        }, raw_content
+
+    return {
+        "action": "finish",
+        "answer_hint": "",
+        "reason": "Fallback because action JSON was invalid and no useful unseen search or document remains.",
+    }, raw_content
+
+
+def _action_to_tool_call(action: Dict[str, Any], tool_call_id: str) -> Dict[str, Any]:
+    action_name = str(action.get("action", "")).strip()
+    if action_name == "search":
+        arguments = {"query": str(action.get("query", "")).strip()}
+        function_name = "search"
+    elif action_name == "get_document":
+        arguments = {"docid": str(action.get("docid", "")).strip()}
+        function_name = "get_document"
+    else:
+        raise ValueError(f"Unsupported tool action: {action_name}")
+
+    return {
+        "id": tool_call_id,
+        "type": "function",
+        "function": {
+            "name": function_name,
+            "arguments": json.dumps(arguments, ensure_ascii=False),
+        },
+    }
 
 
 def _execute_tool_call(
@@ -393,55 +521,65 @@ def run_multistep_agent(
 ) -> Dict[str, Any]:
     state = _init_state(question)
     messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": TOOL_DECISION_SYSTEM_PROMPT},
+        {"role": "system", "content": ACTION_DECISION_SYSTEM_PROMPT},
         {"role": "user", "content": question},
     ]
     recent_observation = "No tool has been used yet."
 
-    for round_id in range(1, max_rounds + 1):
-        state_summary = _build_state_summary(state)
-        round_messages = [
-            {"role": "system", "content": TOOL_DECISION_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": _build_round_user_prompt(
-                    question=question,
-                    state_summary=state_summary,
-                    recent_observation=recent_observation,
-                    max_rounds=max_rounds,
-                    round_id=round_id,
-                ),
-            },
-        ]
-        response = client.simple_chat(
-            model=model_name,
-            messages=round_messages,
-            temperature=0.0,
-            max_tokens=decision_max_tokens,
-            tools=tool_specs,
-            tool_choice="auto",
+    initial_query = question.strip()
+    initial_tool_call = _action_to_tool_call({"action": "search", "query": initial_query}, "call_1")
+    messages.append(
+        {
+            "role": "assistant",
+            "content": "Planning: start with an initial search using the original question.",
+            "state_summary": _build_state_summary(state),
+            "round_id": 1,
+            "tool_calls": [initial_tool_call],
+        }
+    )
+    _, initial_tool_message, recent_observation = _execute_tool_call(
+        tool_call=initial_tool_call,
+        tool_registry=tool_registry,
+        state=state,
+        tool_content_max_chars=tool_content_max_chars,
+    )
+    if initial_tool_message is not None:
+        messages.append(initial_tool_message)
+
+    for round_id in range(2, max_rounds + 1):
+        action, raw_content = _decide_next_action(
+            question=question,
+            state=state,
+            client=client,
+            model_name=model_name,
+            max_rounds=max_rounds,
+            round_id=round_id,
+            decision_max_tokens=decision_max_tokens,
+            recent_observation=recent_observation,
         )
-        assistant_message = response["choices"][0]["message"]
-        raw_content = str(assistant_message.get("content", "") or "")
-        tool_calls = assistant_message.get("tool_calls") or []
+        state_summary = _build_state_summary(state)
+        action_name = str(action.get("action", "")).strip()
 
         trajectory_assistant = {
             "role": "assistant",
             "content": raw_content,
             "state_summary": state_summary,
             "round_id": round_id,
+            "action_plan": action,
         }
-        if tool_calls:
-            trajectory_assistant["tool_calls"] = tool_calls
-        messages.append(trajectory_assistant)
 
-        if not tool_calls:
-            _register_finish_signal(state, raw_content)
-            state["finish_reason"] = state["finish_reason"] or "model_stopped_without_tool"
+        if action_name == "finish":
+            messages.append(trajectory_assistant)
+            _register_finish_signal(state, json.dumps(action, ensure_ascii=False))
+            state["finish_reason"] = "model_or_fallback_finish"
             break
 
-        tool_call = tool_calls[0]
-        executed, tool_message, observation = _execute_tool_call(
+        tool_call_id = f"call_{round_id}"
+        tool_call = _action_to_tool_call(action, tool_call_id)
+        trajectory_assistant["tool_calls"] = [tool_call]
+        messages.append(trajectory_assistant)
+
+        _, tool_message, recent_observation = _execute_tool_call(
             tool_call=tool_call,
             tool_registry=tool_registry,
             state=state,
@@ -449,7 +587,6 @@ def run_multistep_agent(
         )
         if tool_message is not None:
             messages.append(tool_message)
-        recent_observation = observation
 
         stop_reason = _should_stop_after_state_update(state=state, max_rounds=max_rounds, round_id=round_id)
         if stop_reason:
