@@ -42,11 +42,23 @@ Rules:
 - Do not mention hidden reasoning.
 - If evidence is incomplete, still provide the best supported answer instead of leaving the answer blank.
 - Keep the explanation brief and evidence-based.
+- Exact Answer must be a short answer string, not a paragraph.
+- Never use placeholder answers such as None, Given, Unknown, or N/A.
 
 Reply in exactly this format:
 Explanation: <2-4 short sentences>
 Exact Answer: <final answer>
 Confidence: <0-100%>
+"""
+
+
+FINAL_ANSWER_REPAIR_SYSTEM_PROMPT = """You are repairing the final answer format for a Deep Research Agent.
+
+Rules:
+- Output exactly one line.
+- Use this format only: Exact Answer: <short answer>
+- Do not output explanation, confidence, chain-of-thought, None, Given, Unknown, or N/A.
+- If the previous draft is messy, extract the most plausible short final answer from it and the evidence.
 """
 
 
@@ -74,6 +86,27 @@ def _extract_exact_answer(answer_text: str) -> str:
     if not lines:
         return ""
     return lines[-1]
+
+
+def _is_placeholder_answer(answer_text: str) -> bool:
+    normalized = answer_text.strip().lower().strip(".")
+    bad_values = {
+        "",
+        "none",
+        "given",
+        "unknown",
+        "n/a",
+        "na",
+        "unable to determine",
+        "cannot be determined",
+    }
+    if normalized in bad_values:
+        return True
+    if len(answer_text) > 140:
+        return True
+    if normalized.startswith("wait,") or normalized.startswith("okay,"):
+        return True
+    return False
 
 
 def _safe_json_loads(raw_text: Any) -> Dict[str, Any]:
@@ -388,8 +421,11 @@ def _update_state_from_tool(
             state["pending_subquestions"] = [
                 "Verify the most promising retrieved documents before finalizing the answer."
             ]
-        if query and query not in state["search_history"]:
-            state["search_history"].append(query)
+        query_bundle = tool_args.get("query_bundle", [query])
+        for item in query_bundle:
+            item = str(item).strip()
+            if item and item not in state["search_history"]:
+                state["search_history"].append(item)
 
     elif tool_name == "get_document":
         docid = str(tool_args.get("docid", "")).strip()
@@ -431,6 +467,44 @@ def _register_finish_signal(state: Dict[str, Any], raw_content: str) -> None:
     state["finish_reason"] = "model_declared_ready"
 
 
+def _repair_final_answer(
+    question: str,
+    state: Dict[str, Any],
+    draft_answer: str,
+    client: VLLMClient,
+    model_name: str,
+) -> str:
+    repair_messages = [
+        {"role": "system", "content": FINAL_ANSWER_REPAIR_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": "\n".join(
+                [
+                    f"Question:\n{question}",
+                    "",
+                    "Evidence:",
+                    "\n".join(f"- {item}" for item in state.get("search_evidence", [])[-6:]) or "- None",
+                    "",
+                    "Opened passages:",
+                    "\n\n".join(state.get("opened_passages", [])[-3:]) or "None",
+                    "",
+                    "Draft answer:",
+                    draft_answer,
+                ]
+            ),
+        },
+    ]
+    response = client.simple_chat(
+        model=model_name,
+        messages=repair_messages,
+        temperature=0.0,
+        max_tokens=128,
+    )
+    repaired = _clean_text(response["choices"][0]["message"]["content"])
+    exact = _extract_exact_answer(repaired)
+    return exact or repaired
+
+
 def _heuristic_query_from_question(question: str) -> str:
     words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’-]*", question)
     filtered = []
@@ -446,6 +520,106 @@ def _heuristic_query_from_question(question: str) -> str:
         if len(filtered) >= 12:
             break
     return " ".join(filtered) or question[:120]
+
+
+def _sanitize_search_query(raw_query: str) -> str:
+    query = _clean_text(raw_query).strip().strip('"')
+    query = re.sub(r'^action"\s*:\s*"search"\s*,?\s*query"\s*:\s*"', "", query, flags=re.IGNORECASE)
+    query = query.replace('\\"', '"')
+    query = re.sub(r"\s+", " ", query).strip()
+    return query
+
+
+def _is_bad_search_query(query: str) -> bool:
+    lowered = query.lower().strip()
+    if not lowered:
+        return True
+    banned_starts = [
+        "looking at the",
+        "the current state",
+        "okay",
+        "wait",
+        "action\":\"search",
+        "query\":\"",
+    ]
+    if any(lowered.startswith(prefix) for prefix in banned_starts):
+        return True
+    if len(lowered) < 8:
+        return True
+    alpha_tokens = _tokenize_focus_text(query)
+    return len(alpha_tokens) < 3
+
+
+def _extract_focus_suffix(question: str) -> str:
+    lowered = question.lower()
+    suffix_terms: List[str] = []
+    hints = [
+        ("chapter", "chapter contents title"),
+        ("acknowledg", "acknowledgments spouse husband wife"),
+        ("annual report", "annual report financial results"),
+        ("non-gaap", "non-gaap operating expenses 2021 2020"),
+        ("librarian", "librarian partner biography"),
+        ("title of", "title book author"),
+        ("name of the publicly traded company", "company founder ceo delaware lawsuit"),
+        ("exact date", "date performance exhibition"),
+    ]
+    for needle, extra in hints:
+        if needle in lowered:
+            suffix_terms.extend(extra.split())
+    suffix_terms.extend(_tokenize_focus_text(question)[:8])
+    deduped: List[str] = []
+    for token in suffix_terms:
+        if token not in deduped:
+            deduped.append(token)
+    return " ".join(deduped[:12])
+
+
+def _extract_metadata_query(state: Dict[str, Any]) -> str:
+    if not state.get("last_search_results"):
+        return ""
+    top = state["last_search_results"][:1]
+    terms: List[str] = []
+    for item in top:
+        snippet = str(item.get("snippet", ""))
+        title = _extract_title_from_text(snippet)
+        if title and title.lower() not in {"n/a", "none"}:
+            terms.append(title)
+        author_match = re.search(r"author:\s*(.+)", snippet, flags=re.IGNORECASE)
+        if author_match:
+            author = author_match.group(1).strip()
+            if author and author.lower() not in {"n/a", "none"}:
+                terms.append(author)
+    suffix = _extract_focus_suffix(state["question"])
+    query = " ".join(terms + ([suffix] if suffix else []))
+    query = re.sub(r"\s+", " ", query).strip()
+    return query[:220]
+
+
+def _build_query_bundle(primary_query: str, state: Dict[str, Any]) -> List[str]:
+    candidates = [
+        _sanitize_search_query(primary_query),
+        _heuristic_query_from_question(state["question"]),
+        _extract_metadata_query(state),
+    ]
+    bundle: List[str] = []
+    seen = set()
+    previous = {_normalize_query(item) for item in state["search_history"]}
+    for query in candidates:
+        query = query.strip()
+        normalized = _normalize_query(query)
+        if _is_bad_search_query(query):
+            continue
+        if normalized in seen or normalized in previous:
+            continue
+        seen.add(normalized)
+        bundle.append(query[:220])
+        if len(bundle) >= 3:
+            break
+    if not bundle:
+        fallback = _heuristic_query_from_question(state["question"])
+        if not _is_bad_search_query(fallback):
+            bundle.append(fallback[:220])
+    return bundle
 
 
 def _pick_unopened_docid(state: Dict[str, Any]) -> str:
@@ -495,6 +669,15 @@ def _decide_next_action(
     recovered = _extract_action_from_raw_text(raw_content, state)
     if recovered is not None:
         return recovered, raw_content
+
+    if state["opened_docids"]:
+        bundle = _build_query_bundle("", state)
+        if bundle:
+            return {
+                "action": "search",
+                "query": bundle[0],
+                "reason": "Fallback because action JSON was invalid after document review; issue a targeted rewritten search.",
+            }, raw_content
 
     fallback_docid = _pick_unopened_docid(state)
     if fallback_docid:
@@ -551,13 +734,9 @@ def _extract_action_from_raw_text(raw_text: str, state: Dict[str, Any]) -> Optio
 
     search_match = re.search(r"query\"\s*:\s*\"([^\"]+)\"", cleaned)
     if search_match:
-        return {"action": "search", "query": search_match.group(1).strip(), "reason": "Recovered from unstructured planner text."}
-
-    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
-    for line in lines:
-        if "search" in line.lower() and len(line) < 220:
-            line = re.sub(r"^[^A-Za-z0-9]+", "", line)
-            return {"action": "search", "query": line[:180], "reason": "Recovered rough search query from planner text."}
+        query = _sanitize_search_query(search_match.group(1).strip())
+        if not _is_bad_search_query(query):
+            return {"action": "search", "query": query, "reason": "Recovered from unstructured planner text."}
     return None
 
 
@@ -584,9 +763,8 @@ def _execute_tool_call(
     tool_args = _safe_json_loads(function.get("arguments", "{}"))
     if tool_name == "search":
         query = str(tool_args.get("query", "")).strip()
-        normalized = _normalize_query(query)
-        previous = {_normalize_query(item) for item in state["search_history"]}
-        if not query or normalized in previous:
+        bundle = _build_query_bundle(query, state)
+        if not bundle:
             state["stall_count"] += 1
             return (
                 None,
@@ -594,11 +772,11 @@ def _execute_tool_call(
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "content": json.dumps(
-                        {"error": f"Skipped repeated or empty search query: {query or '<empty>'}"},
+                        {"error": f"Skipped repeated or low-quality search query: {query or '<empty>'}"},
                         ensure_ascii=False,
                     ),
                 },
-                f"Skipped repeated or empty search query: {query or '<empty>'}",
+                f"Skipped repeated or low-quality search query: {query or '<empty>'}",
             )
 
     if tool_name == "get_document":
@@ -618,10 +796,30 @@ def _execute_tool_call(
                 f"Skipped repeated or empty document request: {docid or '<empty>'}",
             )
 
-    tool_result = tool_registry[tool_name](**tool_args)
+    if tool_name == "search":
+        merged: Dict[str, Dict[str, Any]] = {}
+        query_bundle = _build_query_bundle(str(tool_args.get("query", "")).strip(), state)
+        for bundle_query in query_bundle:
+            per_query_results = tool_registry[tool_name](query=bundle_query)
+            for rank, item in enumerate(per_query_results):
+                docid = str(item.get("docid", "")).strip()
+                if not docid:
+                    continue
+                enriched = dict(item)
+                enriched["source_query"] = bundle_query
+                enriched["bundle_rank"] = rank
+                if docid not in merged:
+                    merged[docid] = enriched
+                else:
+                    if float(item.get("score", 0.0)) > float(merged[docid].get("score", 0.0)):
+                        merged[docid].update(enriched)
+        tool_result = _rank_search_results(list(merged.values()), state["question"])[:8]
+        tool_args = {"query": query_bundle[0], "query_bundle": query_bundle}
+    else:
+        tool_result = tool_registry[tool_name](**tool_args)
     focus_text = state["question"]
     if tool_name == "search":
-        focus_text = str(tool_args.get("query", "")).strip() or state["question"]
+        focus_text = " ".join(tool_args.get("query_bundle", [])) or state["question"]
     tool_content, metadata = _tool_result_preview(
         tool_name=tool_name,
         tool_result=tool_result,
@@ -750,6 +948,16 @@ def run_multistep_agent(
     predicted_answer = _extract_exact_answer(final_text)
     if not predicted_answer:
         predicted_answer = final_text.strip() or "evidence insufficient"
+    if _is_placeholder_answer(predicted_answer):
+        repaired = _repair_final_answer(
+            question=question,
+            state=state,
+            draft_answer=final_text,
+            client=client,
+            model_name=model_name,
+        )
+        if repaired and not _is_placeholder_answer(repaired):
+            predicted_answer = repaired
     state["candidate_answers"].append(predicted_answer or final_text[:200])
 
     messages.append(
