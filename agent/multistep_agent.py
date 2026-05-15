@@ -108,8 +108,101 @@ def _truncate_text(text: str, max_chars: int) -> str:
     return text[:max_chars].rstrip() + "..."
 
 
-def _tool_result_preview(tool_name: str, tool_result: Any, max_chars: int) -> Tuple[str, Dict[str, Any]]:
+def _tokenize_focus_text(text: str) -> List[str]:
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’-]*", text.lower())
+    stopwords = {
+        "the", "a", "an", "of", "and", "or", "to", "in", "on", "for", "from",
+        "with", "that", "this", "was", "were", "is", "are", "be", "by", "as",
+        "at", "it", "who", "what", "which", "when", "where", "their", "they",
+        "them", "into", "than", "then", "also", "about", "after", "before",
+        "between", "late", "early", "during", "over", "under", "more", "less",
+    }
+    result: List[str] = []
+    for token in tokens:
+        if len(token) < 3 or token in stopwords:
+            continue
+        if token not in result:
+            result.append(token)
+    return result
+
+
+def _extract_title_from_text(text: str) -> str:
+    match = re.search(r"title:\s*(.+)", text, flags=re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def _score_search_result(item: Dict[str, Any], focus_text: str) -> float:
+    haystack = f"{item.get('docid','')} {_extract_title_from_text(str(item.get('snippet','')))} {item.get('snippet','')}".lower()
+    tokens = _tokenize_focus_text(focus_text)[:16]
+    overlap = sum(1 for token in tokens if token in haystack)
+    score = overlap * 5.0 + float(item.get("score", 0.0))
+
+    penalty_terms = [
+        "wikipedia",
+        "archives",
+        "finding aid",
+        "class notes",
+        "faculty",
+        "curriculum vitae",
+        "obituaries",
+        "thank you",
+    ]
+    for term in penalty_terms:
+        if term in haystack:
+            score -= 8.0
+
+    bonus_terms = ["chapter", "contents", "annual report", "acknowledg", "biography", "book"]
+    for term in bonus_terms:
+        if term in haystack:
+            score += 3.0
+    return score
+
+
+def _rank_search_results(results: List[Dict[str, Any]], focus_text: str) -> List[Dict[str, Any]]:
+    return sorted(results, key=lambda item: _score_search_result(item, focus_text), reverse=True)
+
+
+def _extract_relevant_passages(text: str, focus_text: str, max_chars: int, window: int = 320) -> str:
+    plain = text.replace("\r", "")
+    title = _extract_title_from_text(plain)
+    tokens = _tokenize_focus_text(focus_text)[:12]
+    lowered = plain.lower()
+    snippets: List[str] = []
+    seen_spans = set()
+
+    for token in tokens:
+        start = 0
+        found = 0
+        while found < 2:
+            idx = lowered.find(token, start)
+            if idx == -1:
+                break
+            left = max(0, idx - window)
+            right = min(len(plain), idx + window)
+            span_key = (left // 80, right // 80)
+            if span_key not in seen_spans:
+                seen_spans.add(span_key)
+                snippet = plain[left:right].strip().replace("\n", " ")
+                snippets.append(snippet)
+                found += 1
+            start = idx + len(token)
+            if sum(len(s) for s in snippets) >= max_chars:
+                break
+        if sum(len(s) for s in snippets) >= max_chars:
+            break
+
+    if not snippets:
+        snippets = [plain[:max_chars]]
+
+    body = "\n\n".join(_truncate_text(s, min(max_chars, 700)) for s in snippets[:4])
+    if title:
+        body = f"title: {title}\n\n{body}"
+    return _truncate_text(body, max_chars)
+
+
+def _tool_result_preview(tool_name: str, tool_result: Any, max_chars: int, focus_text: str = "") -> Tuple[str, Dict[str, Any]]:
     if tool_name == "search" and isinstance(tool_result, list):
+        ranked = _rank_search_results(tool_result, focus_text or "")
         trimmed = [
             {
                 "docid": item.get("docid", ""),
@@ -117,7 +210,7 @@ def _tool_result_preview(tool_name: str, tool_result: Any, max_chars: int) -> Tu
                 "snippet": _truncate_text(str(item.get("snippet", "")), max_chars),
                 "url": item.get("url", ""),
             }
-            for item in tool_result
+            for item in ranked
         ]
         return json.dumps(trimmed, ensure_ascii=False), {"docids": [item["docid"] for item in trimmed]}
 
@@ -125,7 +218,7 @@ def _tool_result_preview(tool_name: str, tool_result: Any, max_chars: int) -> Tu
         trimmed = {
             "docid": tool_result.get("docid", ""),
             "url": tool_result.get("url", ""),
-            "text": _truncate_text(str(tool_result.get("text", "")), max_chars),
+            "text": _extract_relevant_passages(str(tool_result.get("text", "")), focus_text=focus_text, max_chars=max_chars),
         }
         return json.dumps(trimmed, ensure_ascii=False), {"docids": [trimmed["docid"]]}
 
@@ -219,9 +312,17 @@ def _build_round_user_prompt(
 def _build_final_user_prompt(question: str, state: Dict[str, Any]) -> str:
     evidence_lines = state["confirmed_facts"][-8:]
     candidates = state["candidate_answers"][-3:]
+    opened_passages = state.get("opened_passages", [])[-4:]
+    search_hits = state.get("search_evidence", [])[-6:]
     return "\n".join(
         [
             f"Question:\n{question}",
+            "",
+            "Key search evidence:",
+            "\n".join(f"- {item}" for item in search_hits) or "- None",
+            "",
+            "Opened document evidence:",
+            "\n\n".join(opened_passages) or "None",
             "",
             "Confirmed evidence:",
             "\n".join(f"- {item}" for item in evidence_lines) or "- None",
@@ -249,6 +350,8 @@ def _init_state(question: str) -> Dict[str, Any]:
         "opened_docids": [],
         "seen_docids": [],
         "last_search_results": [],
+        "search_evidence": [],
+        "opened_passages": [],
         "confirmed_facts": [],
         "pending_subquestions": ["Resolve the key entity/relation chain needed by the question."],
         "candidate_answers": [],
@@ -275,10 +378,12 @@ def _update_state_from_tool(
     if tool_name == "search":
         query = str(tool_args.get("query", "")).strip()
         state["last_action"] = f"search:{query}"
-        state["last_search_results"] = tool_result if isinstance(tool_result, list) else []
+        ranked = _rank_search_results(tool_result if isinstance(tool_result, list) else [], query or state["question"])
+        state["last_search_results"] = ranked
         summaries = _summarize_search_result(tool_result)
         if summaries:
             state["confirmed_facts"].extend(summaries)
+            state["search_evidence"].extend(summaries)
             had_new_information = True
             state["pending_subquestions"] = [
                 "Verify the most promising retrieved documents before finalizing the answer."
@@ -299,6 +404,14 @@ def _update_state_from_tool(
             state["pending_subquestions"] = [
                 "Decide whether the current evidence is sufficient for a final answer or another targeted search is needed."
             ]
+        passage = _extract_relevant_passages(
+            str(tool_result.get("text", "")) if isinstance(tool_result, dict) else "",
+            focus_text=state["question"],
+            max_chars=1200,
+        )
+        if passage:
+            state["opened_passages"].append(f"docid={docid}\n{passage}")
+            state["opened_passages"] = state["opened_passages"][-6:]
 
     if had_new_information:
         state["stall_count"] = 0
@@ -306,6 +419,7 @@ def _update_state_from_tool(
         state["stall_count"] += 1
 
     state["confirmed_facts"] = state["confirmed_facts"][-20:]
+    state["search_evidence"] = state["search_evidence"][-12:]
     state["pending_subquestions"] = state["pending_subquestions"][-4:]
 
 
@@ -335,7 +449,8 @@ def _heuristic_query_from_question(question: str) -> str:
 
 
 def _pick_unopened_docid(state: Dict[str, Any]) -> str:
-    for item in state.get("last_search_results", []):
+    ranked = _rank_search_results(state.get("last_search_results", []), state["question"])
+    for item in ranked:
         docid = str(item.get("docid", "")).strip()
         if docid and docid not in state["opened_docids"]:
             return docid
@@ -376,6 +491,10 @@ def _decide_next_action(
     action = _extract_json_object(raw_content)
     if action.get("action") in {"search", "get_document", "finish"}:
         return action, raw_content
+
+    recovered = _extract_action_from_raw_text(raw_content, state)
+    if recovered is not None:
+        return recovered, raw_content
 
     fallback_docid = _pick_unopened_docid(state)
     if fallback_docid:
@@ -420,6 +539,26 @@ def _action_to_tool_call(action: Dict[str, Any], tool_call_id: str) -> Dict[str,
             "arguments": json.dumps(arguments, ensure_ascii=False),
         },
     }
+
+
+def _extract_action_from_raw_text(raw_text: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    cleaned = _clean_text(raw_text)
+    docid_match = re.search(r"docid\s*[:=]\s*\"?(\d{2,})\"?", cleaned, flags=re.IGNORECASE)
+    if docid_match:
+        docid = docid_match.group(1)
+        if docid not in state["opened_docids"]:
+            return {"action": "get_document", "docid": docid, "reason": "Recovered from unstructured planner text."}
+
+    search_match = re.search(r"query\"\s*:\s*\"([^\"]+)\"", cleaned)
+    if search_match:
+        return {"action": "search", "query": search_match.group(1).strip(), "reason": "Recovered from unstructured planner text."}
+
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    for line in lines:
+        if "search" in line.lower() and len(line) < 220:
+            line = re.sub(r"^[^A-Za-z0-9]+", "", line)
+            return {"action": "search", "query": line[:180], "reason": "Recovered rough search query from planner text."}
+    return None
 
 
 def _execute_tool_call(
@@ -480,10 +619,14 @@ def _execute_tool_call(
             )
 
     tool_result = tool_registry[tool_name](**tool_args)
+    focus_text = state["question"]
+    if tool_name == "search":
+        focus_text = str(tool_args.get("query", "")).strip() or state["question"]
     tool_content, metadata = _tool_result_preview(
         tool_name=tool_name,
         tool_result=tool_result,
         max_chars=tool_content_max_chars,
+        focus_text=focus_text,
     )
     observed_docids = metadata.get("docids", [])
     _update_state_from_tool(
