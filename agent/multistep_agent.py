@@ -33,6 +33,21 @@ Use one of these JSON formats exactly:
 """
 
 
+QUESTION_DECOMPOSITION_SYSTEM_PROMPT = """You are preparing a search plan for a Deep Research Agent over an offline corpus.
+
+Analyze the question and output exactly one JSON object with this schema:
+{"answer_type":"person|company|title|year|percentage|date|place|organization|other","primary_query":"...","bridge_query":"...","verification_query":"...","keywords":["...","..."]}
+
+Rules:
+- primary_query should identify the main entity or source document using the rarest clues.
+- bridge_query should be a second search query that links the identified entity to the final fact.
+- verification_query should directly target the requested answer field.
+- Keep each query under 18 words.
+- keywords should contain 3-6 short, high-signal clue phrases.
+- Do not output chain-of-thought, markdown, or any extra text.
+"""
+
+
 FINAL_ANSWER_SYSTEM_PROMPT = """You are a Deep Research Agent.
 
 Use only the evidence provided to produce the final answer.
@@ -88,6 +103,65 @@ def _extract_exact_answer(answer_text: str) -> str:
     return lines[-1]
 
 
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    deduped: List[str] = []
+    seen = set()
+    for item in items:
+        normalized = _normalize_query(item)
+        if not item or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(item)
+    return deduped
+
+
+def _infer_expected_answer_type(question: str) -> str:
+    lowered = question.lower()
+    if "what year" in lowered or "which year" in lowered or "what year did" in lowered:
+        return "year"
+    if "what percentage" in lowered or "percentage decrease" in lowered or "%" in lowered:
+        return "percentage"
+    if "first and last name" in lowered or "what was this person's name" in lowered:
+        return "person"
+    if "name and title" in lowered or "title upon accession" in lowered:
+        return "person"
+    if "identify the company" in lowered or "what company" in lowered:
+        return "company"
+    if "title of the first chapter" in lowered or "provide the title" in lowered or "title of the book" in lowered:
+        return "title"
+    if "what date" in lowered or "on what date" in lowered:
+        return "date"
+    if "what place" in lowered or "which city" in lowered or "which country" in lowered:
+        return "place"
+    return "other"
+
+
+def _normalize_answer_to_type(answer_text: str, expected_type: str) -> str:
+    cleaned = _clean_text(answer_text).strip()
+    cleaned = re.sub(r"^(exact answer|answer)\s*:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = cleaned.strip(" .,:;\"'")
+    if not cleaned:
+        return ""
+    if expected_type == "year":
+        match = re.search(r"\b(17|18|19|20)\d{2}\b", cleaned)
+        return match.group(0) if match else cleaned
+    if expected_type == "percentage":
+        match = re.search(r"\b\d{1,3}(?:\.\d+)?\s*%", cleaned)
+        if match:
+            return match.group(0).replace(" ", "")
+        match = re.search(r"\b\d{1,3}(?:\.\d+)?\b", cleaned)
+        if match:
+            return f"{match.group(0)}%"
+        return cleaned
+    if expected_type in {"person", "company", "organization", "place", "title"}:
+        if "\n" in cleaned:
+            cleaned = cleaned.splitlines()[0].strip()
+        cleaned = re.sub(r"^(the answer is|it is|this is)\s+", "", cleaned, flags=re.IGNORECASE).strip()
+        sentence = re.split(r"(?<=[.!?])\s+", cleaned)[0].strip()
+        return sentence.strip(" .,:;\"'")
+    return cleaned
+
+
 def _is_placeholder_answer(answer_text: str) -> bool:
     normalized = answer_text.strip().lower().strip(".")
     bad_values = {
@@ -105,6 +179,8 @@ def _is_placeholder_answer(answer_text: str) -> bool:
     if len(answer_text) > 140:
         return True
     if normalized.startswith("wait,") or normalized.startswith("okay,"):
+        return True
+    if normalized.startswith("alternatively") or normalized.startswith("looking at the evidence"):
         return True
     return False
 
@@ -157,6 +233,74 @@ def _tokenize_focus_text(text: str) -> List[str]:
         if token not in result:
             result.append(token)
     return result
+
+
+def _build_fallback_question_plan(question: str) -> Dict[str, Any]:
+    expected_type = _infer_expected_answer_type(question)
+    heuristic = _heuristic_query_from_question(question)
+    focus_suffix = _extract_focus_suffix(question)
+    keywords = _tokenize_focus_text(question)[:6]
+    bridge_query = ""
+    verification_query = ""
+    if focus_suffix:
+        verification_query = _truncate_text(focus_suffix, 120)
+    if any(token.isdigit() for token in re.findall(r"\b\d{4}\b", question)):
+        years = " ".join(re.findall(r"\b\d{4}\b", question)[:3])
+        bridge_query = _truncate_text(f"{heuristic} {years}", 160)
+    return {
+        "answer_type": expected_type,
+        "primary_query": heuristic[:180],
+        "bridge_query": bridge_query,
+        "verification_query": verification_query,
+        "keywords": keywords,
+    }
+
+
+def _plan_question(question: str, client: VLLMClient, model_name: str) -> Dict[str, Any]:
+    fallback = _build_fallback_question_plan(question)
+    messages = [
+        {"role": "system", "content": QUESTION_DECOMPOSITION_SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+    try:
+        response = client.simple_chat(
+            model=model_name,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=256,
+        )
+        raw_content = str(response["choices"][0]["message"].get("content", "") or "")
+        parsed = _extract_json_object(raw_content)
+    except Exception:
+        parsed = {}
+
+    answer_type = str(parsed.get("answer_type", "")).strip().lower() or fallback["answer_type"]
+    allowed_types = {"person", "company", "title", "year", "percentage", "date", "place", "organization", "other"}
+    if answer_type not in allowed_types:
+        answer_type = fallback["answer_type"]
+
+    queries = []
+    for key in ("primary_query", "bridge_query", "verification_query"):
+        value = _sanitize_search_query(str(parsed.get(key, "")).strip())
+        if value and not _is_bad_search_query(value):
+            queries.append(value[:180])
+        else:
+            queries.append(str(fallback.get(key, ""))[:180])
+
+    keywords = parsed.get("keywords", fallback["keywords"])
+    if not isinstance(keywords, list):
+        keywords = fallback["keywords"]
+    keywords = [str(item).strip() for item in keywords if str(item).strip()]
+    if not keywords:
+        keywords = fallback["keywords"]
+
+    return {
+        "answer_type": answer_type,
+        "primary_query": queries[0],
+        "bridge_query": queries[1],
+        "verification_query": queries[2],
+        "keywords": keywords[:6],
+    }
 
 
 def _extract_title_from_text(text: str) -> str:
@@ -290,10 +434,22 @@ def _build_state_summary(state: Dict[str, Any]) -> str:
     confirmed_facts = state["confirmed_facts"][-6:]
     pending_subquestions = state["pending_subquestions"][-4:]
     candidate_answers = state["candidate_answers"][-3:]
+    question_plan = state.get("question_plan", {})
+    plan_queries = [
+        query
+        for query in [
+            str(question_plan.get("primary_query", "")).strip(),
+            str(question_plan.get("bridge_query", "")).strip(),
+            str(question_plan.get("verification_query", "")).strip(),
+        ]
+        if query
+    ]
 
     return "\n".join(
         [
             f"Question: {state['question']}",
+            f"Expected answer type: {question_plan.get('answer_type', 'other')}",
+            f"Planned clue queries: {' | '.join(plan_queries[:3]) if plan_queries else 'None'}",
             "",
             "Known facts:",
             numbered(confirmed_facts),
@@ -347,9 +503,13 @@ def _build_final_user_prompt(question: str, state: Dict[str, Any]) -> str:
     candidates = state["candidate_answers"][-3:]
     opened_passages = state.get("opened_passages", [])[-4:]
     search_hits = state.get("search_evidence", [])[-6:]
+    question_plan = state.get("question_plan", {})
     return "\n".join(
         [
             f"Question:\n{question}",
+            "",
+            f"Expected answer type: {question_plan.get('answer_type', 'other')}",
+            f"Planned keywords: {', '.join(question_plan.get('keywords', [])[:6]) or 'None'}",
             "",
             "Key search evidence:",
             "\n".join(f"- {item}" for item in search_hits) or "- None",
@@ -376,9 +536,10 @@ def _should_stop_after_state_update(state: Dict[str, Any], max_rounds: int, roun
     return None
 
 
-def _init_state(question: str) -> Dict[str, Any]:
+def _init_state(question: str, question_plan: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "question": question,
+        "question_plan": question_plan,
         "search_history": [],
         "opened_docids": [],
         "seen_docids": [],
@@ -415,7 +576,6 @@ def _update_state_from_tool(
         state["last_search_results"] = ranked
         summaries = _summarize_search_result(tool_result)
         if summaries:
-            state["confirmed_facts"].extend(summaries)
             state["search_evidence"].extend(summaries)
             had_new_information = True
             state["pending_subquestions"] = [
@@ -481,6 +641,7 @@ def _repair_final_answer(
             "content": "\n".join(
                 [
                     f"Question:\n{question}",
+                    f"Expected answer type: {state.get('question_plan', {}).get('answer_type', 'other')}",
                     "",
                     "Evidence:",
                     "\n".join(f"- {item}" for item in state.get("search_evidence", [])[-6:]) or "- None",
@@ -502,7 +663,8 @@ def _repair_final_answer(
     )
     repaired = _clean_text(response["choices"][0]["message"]["content"])
     exact = _extract_exact_answer(repaired)
-    return exact or repaired
+    normalized = _normalize_answer_to_type(exact or repaired, state.get("question_plan", {}).get("answer_type", "other"))
+    return normalized or exact or repaired
 
 
 def _heuristic_query_from_question(question: str) -> str:
@@ -592,12 +754,28 @@ def _extract_metadata_query(state: Dict[str, Any]) -> str:
     suffix = _extract_focus_suffix(state["question"])
     query = " ".join(terms + ([suffix] if suffix else []))
     query = re.sub(r"\s+", " ", query).strip()
+    title_overlap = _tokenize_focus_text(query)
+    question_tokens = set(_tokenize_focus_text(state["question"]))
+    if not any(token in question_tokens for token in title_overlap[:6]):
+        return ""
     return query[:220]
 
 
+def _next_untried_planned_query(state: Dict[str, Any]) -> str:
+    question_plan = state.get("question_plan", {})
+    previous = {_normalize_query(item) for item in state["search_history"]}
+    for key in ("primary_query", "bridge_query", "verification_query"):
+        query = str(question_plan.get(key, "")).strip()
+        if query and _normalize_query(query) not in previous and not _is_bad_search_query(query):
+            return query[:220]
+    return ""
+
+
 def _build_query_bundle(primary_query: str, state: Dict[str, Any]) -> List[str]:
+    planned_query = _next_untried_planned_query(state)
     candidates = [
         _sanitize_search_query(primary_query),
+        planned_query,
         _heuristic_query_from_question(state["question"]),
         _extract_metadata_query(state),
     ]
@@ -641,6 +819,33 @@ def _decide_next_action(
     decision_max_tokens: int,
     recent_observation: str,
 ) -> Tuple[Dict[str, Any], str]:
+    fallback_docid = _pick_unopened_docid(state)
+    if state["last_action"].startswith("search:") and fallback_docid:
+        return {
+            "action": "get_document",
+            "docid": fallback_docid,
+            "reason": "Heuristic policy: inspect the best unseen document immediately after each search.",
+        }, "Heuristic policy selected get_document after search."
+
+    if (
+        state["last_action"].startswith("get_document:")
+        and len(state["opened_docids"]) < 2
+        and fallback_docid
+        and round_id < max_rounds
+    ):
+        return {
+            "action": "get_document",
+            "docid": fallback_docid,
+            "reason": "Heuristic policy: inspect a second strong candidate before issuing more searches.",
+        }, "Heuristic policy selected a second get_document."
+
+    if round_id >= max_rounds and state["opened_docids"]:
+        return {
+            "action": "finish",
+            "answer_hint": state["candidate_answers"][-1] if state["candidate_answers"] else "",
+            "reason": "Heuristic policy: stop at final round once at least one document has been inspected.",
+        }, "Heuristic policy selected finish at the final round."
+
     state_summary = _build_state_summary(state)
     round_messages = [
         {"role": "system", "content": ACTION_DECISION_SYSTEM_PROMPT},
@@ -845,7 +1050,13 @@ def _execute_tool_call(
         "tool_call_id": tool_call["id"],
         "content": tool_content,
     }
-    observation = f"Executed {tool_name} with args={json.dumps(tool_args, ensure_ascii=False)}"
+    observation = "\n".join(
+        [
+            f"Executed {tool_name} with args={json.dumps(tool_args, ensure_ascii=False)}",
+            "Observed result preview:",
+            _truncate_text(tool_content, 1200),
+        ]
+    )
     return executed, tool_message, observation
 
 
@@ -860,21 +1071,23 @@ def run_multistep_agent(
     answer_max_tokens: int = 768,
     tool_content_max_chars: int = 4000,
 ) -> Dict[str, Any]:
-    state = _init_state(question)
+    question_plan = _plan_question(question=question, client=client, model_name=model_name)
+    state = _init_state(question, question_plan=question_plan)
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": ACTION_DECISION_SYSTEM_PROMPT},
         {"role": "user", "content": question},
     ]
     recent_observation = "No tool has been used yet."
 
-    initial_query = question.strip()
+    initial_query = str(question_plan.get("primary_query", "")).strip() or question.strip()
     initial_tool_call = _action_to_tool_call({"action": "search", "query": initial_query}, "call_1")
     messages.append(
         {
             "role": "assistant",
-            "content": "Planning: start with an initial search using the original question.",
+            "content": "Planning: start with an initial search using the decomposed primary query.",
             "state_summary": _build_state_summary(state),
             "round_id": 1,
+            "question_plan": question_plan,
             "tool_calls": [initial_tool_call],
         }
     )
@@ -945,9 +1158,15 @@ def run_multistep_agent(
         max_tokens=answer_max_tokens,
     )
     final_text = _clean_text(final_response["choices"][0]["message"]["content"])
-    predicted_answer = _extract_exact_answer(final_text)
+    predicted_answer = _normalize_answer_to_type(
+        _extract_exact_answer(final_text),
+        question_plan.get("answer_type", "other"),
+    )
     if not predicted_answer:
-        predicted_answer = final_text.strip() or "evidence insufficient"
+        predicted_answer = _normalize_answer_to_type(
+            final_text.strip() or "evidence insufficient",
+            question_plan.get("answer_type", "other"),
+        )
     if _is_placeholder_answer(predicted_answer):
         repaired = _repair_final_answer(
             question=question,
@@ -958,6 +1177,7 @@ def run_multistep_agent(
         )
         if repaired and not _is_placeholder_answer(repaired):
             predicted_answer = repaired
+    predicted_answer = _normalize_answer_to_type(predicted_answer or final_text[:200], question_plan.get("answer_type", "other"))
     state["candidate_answers"].append(predicted_answer or final_text[:200])
 
     messages.append(
