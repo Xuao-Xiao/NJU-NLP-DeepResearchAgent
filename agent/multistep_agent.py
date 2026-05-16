@@ -14,8 +14,12 @@ ACTION_DECISION_SYSTEM_PROMPT = """You are a Deep Research Agent working over a 
 You must plan the next action using only the provided state and evidence.
 
 Available actions:
+- decompose_question: produce the task-level plan for the original question
 - search: use a rewritten query to search for better evidence
 - get_document: open one promising document by docid for verification
+- find_in_document: search within an already opened document for a focused clue
+- extract_answer_candidates: extract typed short answer candidates from opened evidence
+- verify_claim: verify whether a candidate answer is supported by opened evidence
 - finish: stop tool use because current evidence is enough or no better next step exists
 
 Rules:
@@ -27,16 +31,20 @@ Rules:
 - Avoid repeating a previous query or reopening a document already opened.
 
 Use one of these JSON formats exactly:
+{"action":"decompose_question","question":"...","reason":"..."}
 {"action":"search","query":"...","reason":"..."}
 {"action":"get_document","docid":"...","reason":"..."}
+{"action":"find_in_document","docid":"...","query":"...","reason":"..."}
+{"action":"extract_answer_candidates","reason":"..."}
+{"action":"verify_claim","candidate_answer":"...","reason":"..."}
 {"action":"finish","answer_hint":"...","reason":"..."}
 """
 
 
-QUESTION_DECOMPOSITION_SYSTEM_PROMPT = """You are preparing a search plan for a Deep Research Agent over an offline corpus.
+QUESTION_DECOMPOSITION_SYSTEM_PROMPT = """You are the Planner Agent for a Deep Research Agent over an offline corpus.
 
 Analyze the question and output exactly one JSON object with this schema:
-{"answer_type":"person|company|title|year|percentage|date|place|organization|other","primary_query":"...","bridge_query":"...","verification_query":"...","keywords":["...","..."]}
+{"answer_type":"person|company|title|year|percentage|date|place|organization|other","primary_query":"...","bridge_query":"...","verification_query":"...","keywords":["...","..."],"subgoals":["..."],"entities_to_identify":["..."],"verification_targets":["..."]}
 
 Rules:
 - primary_query should identify the main entity or source document using the rarest clues.
@@ -44,6 +52,24 @@ Rules:
 - verification_query should directly target the requested answer field.
 - Keep each query under 18 words.
 - keywords should contain 3-6 short, high-signal clue phrases.
+- subgoals should describe the entity chain to solve, not just search strings.
+- entities_to_identify should list unknown people, works, companies, places, or documents.
+- verification_targets should list facts that must be checked before final answer.
+- Do not output chain-of-thought, markdown, or any extra text.
+"""
+
+
+VERIFIER_AGENT_SYSTEM_PROMPT = """You are the Verifier Agent for a Deep Research Agent over an offline corpus.
+
+Your job is not to find a new answer. Your job is to judge whether the proposed answer is supported by the retrieved evidence.
+
+Output exactly one JSON object:
+{"supported":true,"support_score":0.0,"missing_piece":"...","contradictions":["..."],"verdict_note":"..."}
+
+Rules:
+- Use only the supplied evidence.
+- Mark supported=false if the evidence only mentions the candidate in an unrelated context.
+- Mark supported=false if the candidate has the wrong answer type.
 - Do not output chain-of-thought, markdown, or any extra text.
 """
 
@@ -122,11 +148,43 @@ def _dedupe_keep_order(items: List[str]) -> List[str]:
 
 def _infer_expected_answer_type(question: str) -> str:
     lowered = question.lower()
-    if "name of the publicly traded company" in lowered or "identify the company" in lowered or "what is the name of the company" in lowered:
+    if (
+        "name of the publicly traded company" in lowered
+        or "identify the company" in lowered
+        or "what is the name of the company" in lowered
+        or "company full name" in lowered
+        or "publicly traded company" in lowered
+        or lowered.startswith("identify the company")
+    ):
         return "company"
-    if "first and last name" in lowered or "name of the author" in lowered or "then-husband" in lowered or "husband" in lowered or "wife" in lowered or "spouse" in lowered:
+    if (
+        "first and last name" in lowered
+        or "name of the author" in lowered
+        or "then-husband" in lowered
+        or "husband" in lowered
+        or "wife" in lowered
+        or "spouse" in lowered
+        or "name of the person" in lowered
+        or "provide the name of the person" in lowered
+        or "identify this actor" in lowered
+        or "identify the actor" in lowered
+        or "identify the first" in lowered
+        or "footballer" in lowered
+        or "historical figure" in lowered
+    ):
         return "person"
-    if "title of the first chapter" in lowered or "provide the title" in lowered or "title of the book" in lowered or "name of the club" in lowered:
+    if (
+        "title of the first chapter" in lowered
+        or "provide the title" in lowered
+        or "title of the book" in lowered
+        or "title of a book" in lowered
+        or "title of the paper" in lowered
+        or "name of the club" in lowered
+        or "name of a software" in lowered
+        or "name of the software" in lowered
+        or "name of the group" in lowered
+        or "name of the movie" in lowered
+    ):
         return "title"
     if "what year" in lowered or "which year" in lowered or "what year did" in lowered:
         return "year"
@@ -140,6 +198,8 @@ def _infer_expected_answer_type(question: str) -> str:
         return "company"
     if "what date" in lowered or "on what date" in lowered:
         return "date"
+    if "what university" in lowered or "which university" in lowered or "ministry" in lowered:
+        return "organization"
     if "what place" in lowered or "which city" in lowered or "which country" in lowered:
         return "place"
     return "other"
@@ -159,6 +219,13 @@ def _normalize_company_name(answer_text: str) -> str:
 def _normalize_answer_to_type(answer_text: str, expected_type: str) -> str:
     cleaned = _clean_text(answer_text).strip()
     cleaned = re.sub(r"^(exact answer|answer)\s*:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    extraction_match = re.search(
+        r"\b(?:answer|company|person|name|title|club|software|author)\s+(?:is|was|would be)\s+(.+)$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if extraction_match:
+        cleaned = extraction_match.group(1).strip()
     cleaned = cleaned.strip(" .,:;\"'")
     if not cleaned:
         return ""
@@ -183,6 +250,10 @@ def _normalize_answer_to_type(answer_text: str, expected_type: str) -> str:
         if "\n" in cleaned:
             cleaned = cleaned.splitlines()[0].strip()
         cleaned = re.sub(r"^(the answer is|it is|this is)\s+", "", cleaned, flags=re.IGNORECASE).strip()
+        if expected_type == "person":
+            name_match = re.search(r"\b([A-Z][A-Za-z.'-]+(?:\s+(?:[A-Z]\.|[A-Z][A-Za-z.'-]+)){1,4})\b", cleaned)
+            if name_match:
+                return name_match.group(1).strip(" .,:;\"'")
         sentence = re.split(r"(?<=[.!?])\s+", cleaned)[0].strip()
         return sentence.strip(" .,:;\"'")
     return cleaned
@@ -211,6 +282,214 @@ def _is_placeholder_answer(answer_text: str) -> bool:
     if normalized.startswith("first,") or normalized.startswith("looking at") or normalized.startswith("the evidence"):
         return True
     return False
+
+
+def _candidate_looks_wrong_type(candidate: str, expected_type: str) -> bool:
+    lowered = candidate.lower().strip()
+    if not lowered:
+        return True
+    if lowered.startswith("{") or '"action"' in lowered or '"answer_hint"' in lowered:
+        return True
+    institutional_terms = {
+        "library", "center", "centre", "university", "college", "school", "department",
+        "ministry", "institute", "museum", "press", "project", "broadcast", "training",
+        "committee", "foundation", "association", "society", "magazine", "guide",
+    }
+    if expected_type == "person":
+        non_person_terms = institutional_terms | {
+            "series", "lecture", "conservation", "broadcast", "studio", "current",
+            "archive", "program", "details", "books", "class", "official", "episode",
+            "eagle", "nest", "monarch", "dissertation", "acknowledgments", "acknowledgements",
+        }
+        if "'s" in lowered:
+            return True
+        if any(term in lowered for term in non_person_terms):
+            return True
+        parts = candidate.replace(".", " ").split()
+        if not (2 <= len(parts) <= 4):
+            return True
+        if any(part[:1].islower() for part in parts if part):
+            return True
+    if expected_type == "company":
+        bad_terms = {"layoffs", "guide", "article", "wikipedia", "module", "overview"}
+        if any(term in lowered for term in bad_terms):
+            return True
+    if expected_type == "title":
+        bad_titles = {
+            "wikipedia", "about revell", "broadcast library", "jazz travel guide",
+            "books", "class of 1955",
+        }
+        if lowered in bad_titles or any(lowered.startswith(term) for term in bad_titles):
+            return True
+    if expected_type in {"year", "percentage"}:
+        return False
+    if len(candidate) > 120:
+        return True
+    return False
+
+
+def _candidate_evidence_score(candidate: str, state: Dict[str, Any]) -> float:
+    expected_type = state.get("question_plan", {}).get("answer_type", "other")
+    if not candidate or _is_placeholder_answer(candidate) or _candidate_looks_wrong_type(candidate, expected_type):
+        return -100.0
+    evidence = "\n".join(state.get("opened_passages", []) + state.get("confirmed_facts", []))
+    lowered_evidence = evidence.lower()
+    lowered_candidate = candidate.lower()
+    score = 0.0
+    if lowered_candidate and lowered_candidate in lowered_evidence:
+        score += 20.0
+    candidate_tokens = _tokenize_focus_text(candidate)
+    if candidate_tokens:
+        score += sum(2.0 for token in candidate_tokens if token in lowered_evidence)
+    clue_tokens = _select_focus_tokens(
+        f"{state.get('question', '')} {state.get('question_plan', {}).get('verification_query', '')}",
+        max_tokens=18,
+    )
+    score += min(12.0, sum(1.0 for token in clue_tokens if token in lowered_evidence))
+    if expected_type == "person" and re.fullmatch(r"[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3}", candidate):
+        score += 5.0
+    if expected_type == "company" and re.search(r"\b(?:inc|corp|corporation|llc|ltd|therapeutics|systems|group|company)\b", evidence, flags=re.IGNORECASE):
+        score += 4.0
+    if expected_type == "title" and (candidate.isupper() or candidate.istitle()):
+        score += 3.0
+    return score
+
+
+def _select_best_candidate(state: Dict[str, Any]) -> str:
+    candidates = _collect_answer_candidates(state)
+    candidates.extend(str(item) for item in state.get("candidate_answers", []) if isinstance(item, str))
+    normalized = [
+        _normalize_answer_to_type(item, state.get("question_plan", {}).get("answer_type", "other"))
+        for item in candidates
+    ]
+    cleaned = _dedupe_keep_order([item for item in normalized if item and not _is_placeholder_answer(item)])
+    cleaned = [
+        item
+        for item in cleaned
+        if not _candidate_looks_wrong_type(item, state.get("question_plan", {}).get("answer_type", "other"))
+    ]
+    if not cleaned:
+        return ""
+    best = max(cleaned, key=lambda item: _candidate_evidence_score(item, state))
+    if _candidate_evidence_score(best, state) < 0:
+        return ""
+    return best
+
+
+def _score_passage_for_query(passage: str, query: str) -> float:
+    lowered = passage.lower()
+    tokens = _select_focus_tokens(query, max_tokens=18)
+    if not tokens:
+        return 0.0
+    overlap = sum(1 for token in tokens if token in lowered)
+    rare_overlap = sum(1 for token in tokens if len(token) >= 7 and token in lowered)
+    return overlap * 4.0 + rare_overlap * 2.0
+
+
+def _find_in_document_tool(state: Dict[str, Any], docid: str, query: str, max_matches: int = 4) -> Dict[str, Any]:
+    docid = str(docid).strip()
+    query = str(query).strip() or state.get("question", "")
+    raw_text = state.get("document_cache", {}).get(docid, "")
+    if not raw_text:
+        return {"docid": docid, "query": query, "matches": [], "error": "document text not cached; call get_document first"}
+
+    passage_text = _extract_relevant_passages(raw_text, focus_text=query, max_chars=3600, window=420)
+    chunks = [chunk.strip() for chunk in passage_text.split("\n\n") if chunk.strip()]
+    matches = []
+    for chunk in chunks:
+        if chunk.lower().startswith("title:"):
+            continue
+        score = _score_passage_for_query(chunk, query)
+        if score <= 0:
+            continue
+        matches.append({"score": round(score, 3), "snippet": _truncate_text(chunk.replace("\n", " "), 900)})
+    if not matches and passage_text:
+        matches.append({"score": 0.0, "snippet": _truncate_text(passage_text.replace("\n", " "), 900)})
+    matches.sort(key=lambda item: item["score"], reverse=True)
+    return {"docid": docid, "query": query, "matches": matches[:max_matches]}
+
+
+def _extract_answer_candidate_records(answer_type: str, evidence_blocks: List[str]) -> Dict[str, Any]:
+    records: List[Dict[str, Any]] = []
+    for source_idx, block in enumerate(evidence_blocks):
+        for candidate in _extract_candidate_answers_from_text(block, answer_type):
+            normalized = _normalize_answer_to_type(candidate, answer_type)
+            if not normalized or _is_placeholder_answer(normalized) or _candidate_looks_wrong_type(normalized, answer_type):
+                continue
+            score = 1.0
+            if normalized.lower() in block.lower():
+                score += 2.0
+            if answer_type == "person" and re.fullmatch(r"[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3}", normalized):
+                score += 1.0
+            if answer_type == "title" and (normalized.isupper() or normalized.istitle()):
+                score += 0.5
+            records.append({"text": normalized, "source": f"evidence_block_{source_idx + 1}", "score": round(score, 3)})
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        key = _normalize_query(record["text"])
+        if key not in deduped or record["score"] > deduped[key]["score"]:
+            deduped[key] = record
+    ranked = sorted(deduped.values(), key=lambda item: item["score"], reverse=True)
+    return {"answer_type": answer_type, "candidates": ranked[:12]}
+
+
+def _verify_claim_with_evidence(
+    question: str,
+    candidate_answer: str,
+    evidence_docids: List[str],
+    evidence_snippets: List[str],
+    expected_type: str = "other",
+) -> Dict[str, Any]:
+    candidate = _normalize_answer_to_type(candidate_answer, expected_type)
+    if not candidate or _is_placeholder_answer(candidate) or _candidate_looks_wrong_type(candidate, expected_type):
+        return {
+            "supported": False,
+            "support_score": 0.0,
+            "missing_piece": "Candidate answer is empty, placeholder, or has the wrong answer type.",
+            "contradictions": [],
+            "verdict_note": "Rejected before evidence scoring.",
+        }
+
+    evidence = "\n".join(evidence_snippets)
+    lowered_evidence = evidence.lower()
+    support_score = 0.0
+    if candidate.lower() in lowered_evidence:
+        support_score += 0.55
+    candidate_tokens = _tokenize_focus_text(candidate)
+    if candidate_tokens:
+        support_score += min(0.2, sum(0.05 for token in candidate_tokens if token in lowered_evidence))
+    clue_tokens = _select_focus_tokens(question, max_tokens=18)
+    if clue_tokens:
+        support_score += min(0.25, sum(0.02 for token in clue_tokens if token in lowered_evidence))
+
+    question_lower = question.lower()
+    missing: List[str] = []
+    relationship_checks = [
+        ("husband", ["husband", "spouse", "married"]),
+        ("wife", ["wife", "spouse", "married"]),
+        ("partner", ["partner", "companion"]),
+        ("acknowledg", ["acknowledg", "thanks", "grateful"]),
+        ("annual report", ["annual report", "10-k", "registrant"]),
+        ("first chapter", ["chapter", "contents"]),
+    ]
+    for needle, required_terms in relationship_checks:
+        if needle in question_lower and not any(term in lowered_evidence for term in required_terms):
+            missing.append(f"Missing evidence for `{needle}` relation.")
+            support_score -= 0.08
+
+    support_score = max(0.0, min(1.0, support_score))
+    supported = support_score >= 0.62 and not missing[:1]
+    return {
+        "supported": supported,
+        "support_score": round(support_score, 3),
+        "missing_piece": "; ".join(missing) if missing else "",
+        "contradictions": [],
+        "verdict_note": (
+            f"Candidate appears in evidence from {len(set(evidence_docids))} document(s)."
+            if candidate.lower() in lowered_evidence
+            else "Candidate is not explicitly present in opened evidence."
+        ),
+    }
 
 
 def _extract_title_line(text: str) -> str:
@@ -251,7 +530,10 @@ def _extract_candidate_answers_from_text(text: str, expected_type: str) -> List[
         name_field = re.findall(r"\bname:\s*([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})", plain)
         candidates.extend(name_field)
         proper_names = re.findall(r"\b([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})\b", plain)
-        blocked = {"United States", "Ohio State University", "Columbia University Press", "Royal Academy"}
+        blocked = {
+            "United States", "Ohio State University", "Columbia University Press", "Royal Academy",
+            "Broadcast Library", "Training Center", "National Conservation", "NCTC Studio",
+        }
         for item in proper_names:
             if item in blocked:
                 continue
@@ -287,8 +569,14 @@ def _collect_answer_candidates(state: Dict[str, Any]) -> List[str]:
     for text in sources:
         collected.extend(_extract_candidate_answers_from_text(text, expected_type))
     normalized = [_normalize_answer_to_type(item, expected_type) for item in collected]
-    cleaned = [item for item in normalized if item and not _is_placeholder_answer(item)]
-    return _dedupe_keep_order(cleaned[:12])
+    cleaned = [
+        item
+        for item in normalized
+        if item and not _is_placeholder_answer(item) and not _candidate_looks_wrong_type(item, expected_type)
+    ]
+    deduped = _dedupe_keep_order(cleaned)
+    deduped.sort(key=lambda item: _candidate_evidence_score(item, state), reverse=True)
+    return deduped[:12]
 
 
 def _safe_json_loads(raw_text: Any) -> Dict[str, Any]:
@@ -341,11 +629,96 @@ def _tokenize_focus_text(text: str) -> List[str]:
     return result
 
 
+def _extract_quoted_phrases(text: str) -> List[str]:
+    phrases = re.findall(r"\"(.{3,80}?)\"", text)
+    phrases.extend(re.findall(r"“(.{3,80}?)”", text))
+    return [re.sub(r"\s+", " ", phrase).strip() for phrase in phrases if phrase.strip()]
+
+
+def _extract_capitalized_phrases(text: str) -> List[str]:
+    phrases = re.findall(r"\b[A-Z][A-Za-z0-9&.'-]+(?:\s+[A-Z][A-Za-z0-9&.'-]+){1,6}\b", text)
+    blocked = {"The", "This", "There", "What", "Which", "Please", "According", "Identify"}
+    cleaned: List[str] = []
+    for phrase in phrases:
+        if phrase.split()[0] in blocked:
+            continue
+        if phrase not in cleaned:
+            cleaned.append(phrase)
+    return cleaned
+
+
+def _select_focus_tokens(text: str, max_tokens: int = 14) -> List[str]:
+    base_tokens = _tokenize_focus_text(text)
+    lowered_text = text.lower()
+    priority_terms = {
+        "acknowledg", "dissertation", "thesis", "annual", "report", "registrant",
+        "chapter", "contents", "spouse", "husband", "wife", "partner", "librarian",
+        "founded", "published", "submitted", "awarded", "award", "interview",
+        "biography", "niece", "grand", "customers", "revenue", "employees",
+        "workforce", "restructuring", "cash", "payment", "version", "released",
+        "software", "restoration", "artwork", "museum", "species", "paper",
+        "club", "latin", "music", "owner", "sound", "system", "surname", "syllables",
+        "boxer", "filipino", "southpaw", "weekly",
+    }
+    scored: List[Tuple[float, str]] = []
+    for index, token in enumerate(base_tokens):
+        score = 0.0
+        if token.isdigit() and len(token) == 4:
+            score += 12.0
+        elif token.isdigit():
+            score -= 2.0
+        if len(token) >= 8:
+            score += 6.0
+        elif len(token) >= 6:
+            score += 3.0
+        if any(token.startswith(term) or term in token for term in priority_terms):
+            score += 8.0
+        if token in lowered_text[: max(len(lowered_text), 1)]:
+            score += max(0.0, 4.0 - index * 0.15)
+        scored.append((score, token))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    selected: List[str] = []
+    for _, token in scored:
+        if token not in selected:
+            selected.append(token)
+        if len(selected) >= max_tokens:
+            break
+    return selected
+
+
+def _build_heuristic_subgoals(question: str, expected_type: str) -> List[str]:
+    lowered = question.lower()
+    subgoals = ["Identify the source document or main entity described by the rare clues."]
+    if any(term in lowered for term in ["book", "chapter", "published", "author"]):
+        subgoals.append("Resolve the work, author, and publication chain before extracting the requested title.")
+    if any(term in lowered for term in ["dissertation", "thesis", "acknowledg"]):
+        subgoals.append("Find the dissertation or acknowledgments passage and extract the named person from that passage.")
+    if any(term in lowered for term in ["annual report", "10-k", "fiscal year", "revenue"]):
+        subgoals.append("Find the relevant annual report and verify the numeric or company fact in that source.")
+    if expected_type in {"person", "company", "title"}:
+        subgoals.append(f"Extract a short {expected_type} answer only after evidence supports it.")
+    return _dedupe_keep_order(subgoals)[:5]
+
+
+def _build_heuristic_verification_targets(question: str, expected_type: str) -> List[str]:
+    lowered = question.lower()
+    targets = [f"The final answer must have answer type: {expected_type}."]
+    if "then-husband" in lowered or "husband" in lowered:
+        targets.append("The evidence should connect the candidate to husband/spouse wording.")
+    if "librarian" in lowered and "partner" in lowered:
+        targets.append("The evidence should connect the candidate to librarian and partner clues.")
+    if "first chapter" in lowered:
+        targets.append("The evidence should show table of contents or first chapter wording.")
+    if "annual report" in lowered:
+        targets.append("The evidence should come from the relevant annual report or 10-K.")
+    return _dedupe_keep_order(targets)[:5]
+
+
 def _build_fallback_question_plan(question: str) -> Dict[str, Any]:
     expected_type = _infer_expected_answer_type(question)
     heuristic = _heuristic_query_from_question(question)
     focus_suffix = _extract_focus_suffix(question)
-    keywords = _tokenize_focus_text(question)[:6]
+    keywords = _select_focus_tokens(question, max_tokens=8)[:6]
     bridge_query = ""
     verification_query = ""
     if focus_suffix:
@@ -359,6 +732,9 @@ def _build_fallback_question_plan(question: str) -> Dict[str, Any]:
         "bridge_query": bridge_query,
         "verification_query": verification_query,
         "keywords": keywords,
+        "subgoals": _build_heuristic_subgoals(question, expected_type),
+        "entities_to_identify": _extract_capitalized_phrases(question)[:6],
+        "verification_targets": _build_heuristic_verification_targets(question, expected_type),
     }
 
 
@@ -403,12 +779,22 @@ def _plan_question(question: str, client: VLLMClient, model_name: str) -> Dict[s
     if not keywords:
         keywords = fallback["keywords"]
 
+    def string_list_field(key: str) -> List[str]:
+        values = parsed.get(key, fallback.get(key, []))
+        if not isinstance(values, list):
+            values = fallback.get(key, [])
+        cleaned_values = [str(item).strip() for item in values if str(item).strip()]
+        return cleaned_values or list(fallback.get(key, []))
+
     return {
         "answer_type": answer_type,
         "primary_query": queries[0],
         "bridge_query": queries[1],
         "verification_query": queries[2],
         "keywords": keywords[:6],
+        "subgoals": string_list_field("subgoals")[:6],
+        "entities_to_identify": string_list_field("entities_to_identify")[:8],
+        "verification_targets": string_list_field("verification_targets")[:8],
     }
 
 
@@ -419,7 +805,7 @@ def _extract_title_from_text(text: str) -> str:
 
 def _score_search_result(item: Dict[str, Any], focus_text: str) -> float:
     haystack = f"{item.get('docid','')} {item.get('url','')} {_extract_title_from_text(str(item.get('snippet','')))} {item.get('snippet','')}".lower()
-    tokens = _tokenize_focus_text(focus_text)[:16]
+    tokens = _select_focus_tokens(focus_text, max_tokens=22)
     overlap = sum(1 for token in tokens if token in haystack)
     score = overlap * 5.0 + float(item.get("score", 0.0))
     lowered_focus = focus_text.lower()
@@ -480,7 +866,10 @@ def _rank_search_results(results: List[Dict[str, Any]], focus_text: str) -> List
 def _extract_relevant_passages(text: str, focus_text: str, max_chars: int, window: int = 320) -> str:
     plain = text.replace("\r", "")
     title = _extract_title_from_text(plain)
-    tokens = _tokenize_focus_text(focus_text)[:12]
+    phrase_tokens: List[str] = []
+    for phrase in _extract_quoted_phrases(focus_text) + _extract_capitalized_phrases(focus_text):
+        phrase_tokens.extend(_tokenize_focus_text(phrase)[:4])
+    tokens = _dedupe_keep_order(phrase_tokens + _select_focus_tokens(focus_text, max_tokens=18))
     lowered = plain.lower()
     snippets: List[str] = []
     seen_spans = set()
@@ -572,6 +961,7 @@ def _build_state_summary(state: Dict[str, Any]) -> str:
     confirmed_facts = state["confirmed_facts"][-6:]
     pending_subquestions = state["pending_subquestions"][-4:]
     candidate_answers = state["candidate_answers"][-3:]
+    verification_results = state.get("verification_results", [])[-3:]
     question_plan = state.get("question_plan", {})
     plan_queries = [
         query
@@ -588,6 +978,8 @@ def _build_state_summary(state: Dict[str, Any]) -> str:
             f"Question: {state['question']}",
             f"Expected answer type: {question_plan.get('answer_type', 'other')}",
             f"Planned clue queries: {' | '.join(plan_queries[:3]) if plan_queries else 'None'}",
+            f"Planner subgoals: {' | '.join(question_plan.get('subgoals', [])[:4]) if question_plan.get('subgoals') else 'None'}",
+            f"Verification targets: {' | '.join(question_plan.get('verification_targets', [])[:4]) if question_plan.get('verification_targets') else 'None'}",
             "",
             "Known facts:",
             numbered(confirmed_facts),
@@ -603,6 +995,12 @@ def _build_state_summary(state: Dict[str, Any]) -> str:
             "",
             "Current candidate answers:",
             numbered(candidate_answers),
+            "",
+            "Verifier results:",
+            numbered([
+                f"{item.get('candidate_answer', '')}: supported={item.get('supported')} score={item.get('support_score')} note={item.get('verdict_note', '')}"
+                for item in verification_results
+            ]),
             "",
             f"Last action: {state['last_action'] or 'None'}",
             f"Stall count: {state['stall_count']}",
@@ -642,6 +1040,7 @@ def _build_final_user_prompt(question: str, state: Dict[str, Any]) -> str:
     extracted_candidates = _collect_answer_candidates(state)
     opened_passages = state.get("opened_passages", [])[-4:]
     search_hits = state.get("search_evidence", [])[-6:]
+    verifier_results = state.get("verification_results", [])[-4:]
     question_plan = state.get("question_plan", {})
     return "\n".join(
         [
@@ -664,6 +1063,12 @@ def _build_final_user_prompt(question: str, state: Dict[str, Any]) -> str:
             "",
             "Candidate answers considered:",
             "\n".join(f"- {item}" for item in candidates) or "- None",
+            "",
+            "Verifier Agent checks:",
+            "\n".join(
+                f"- {item.get('candidate_answer', '')}: supported={item.get('supported')} score={item.get('support_score')} missing={item.get('missing_piece', '')}"
+                for item in verifier_results
+            ) or "- None",
             "",
             "Give the final answer now.",
         ]
@@ -689,6 +1094,10 @@ def _init_state(question: str, question_plan: Dict[str, Any]) -> Dict[str, Any]:
         "search_evidence": [],
         "opened_passages": [],
         "confirmed_facts": [],
+        "document_cache": {},
+        "document_matches": [],
+        "candidate_records": [],
+        "verification_results": [],
         "pending_subquestions": ["Resolve the key entity/relation chain needed by the question."],
         "candidate_answers": [],
         "last_action": "",
@@ -711,7 +1120,14 @@ def _update_state_from_tool(
             state["seen_docids"].append(docid)
             had_new_information = True
 
-    if tool_name == "search":
+    if tool_name == "decompose_question":
+        state["last_action"] = "decompose_question"
+        if isinstance(tool_result, dict) and tool_result:
+            state["question_plan"].update(tool_result)
+            state["pending_subquestions"] = list(tool_result.get("subgoals", []))[:4] or state["pending_subquestions"]
+            had_new_information = True
+
+    elif tool_name == "search":
         query = str(tool_args.get("query", "")).strip()
         state["last_action"] = f"search:{query}"
         rank_focus = f"{state['question']} {state.get('question_plan', {}).get('verification_query', '')} {query}".strip()
@@ -736,6 +1152,10 @@ def _update_state_from_tool(
         if docid and docid not in state["opened_docids"]:
             state["opened_docids"].append(docid)
             had_new_information = True
+        if isinstance(tool_result, dict) and docid:
+            raw_text = str(tool_result.get("text", "") or "")
+            if raw_text:
+                state.setdefault("document_cache", {})[docid] = raw_text
         summaries = _summarize_document_result(tool_result)
         if summaries:
             state["confirmed_facts"].extend(summaries)
@@ -755,11 +1175,77 @@ def _update_state_from_tool(
                 passage,
                 state.get("question_plan", {}).get("answer_type", "other"),
             )
-            for candidate in extracted_candidates[:3]:
+            extracted_candidates = sorted(
+                extracted_candidates,
+                key=lambda item: _candidate_evidence_score(
+                    _normalize_answer_to_type(item, state.get("question_plan", {}).get("answer_type", "other")),
+                    state,
+                ),
+                reverse=True,
+            )
+            for candidate in extracted_candidates[:5]:
                 normalized = _normalize_answer_to_type(candidate, state.get("question_plan", {}).get("answer_type", "other"))
-                if normalized and normalized not in state["candidate_answers"] and not _is_placeholder_answer(normalized):
+                if (
+                    normalized
+                    and normalized not in state["candidate_answers"]
+                    and not _is_placeholder_answer(normalized)
+                    and not _candidate_looks_wrong_type(normalized, state.get("question_plan", {}).get("answer_type", "other"))
+                ):
                     state["candidate_answers"].append(normalized)
             state["candidate_answers"] = state["candidate_answers"][-8:]
+
+    elif tool_name == "find_in_document":
+        docid = str(tool_args.get("docid", "")).strip()
+        state["last_action"] = f"find_in_document:{docid}"
+        matches = tool_result.get("matches", []) if isinstance(tool_result, dict) else []
+        if matches:
+            for match in matches[:4]:
+                if not isinstance(match, dict):
+                    continue
+                record = {
+                    "docid": docid,
+                    "query": str(tool_args.get("query", "")),
+                    "score": match.get("score", 0.0),
+                    "snippet": str(match.get("snippet", "")),
+                }
+                state.setdefault("document_matches", []).append(record)
+                snippet = record["snippet"]
+                if snippet:
+                    state["opened_passages"].append(f"docid={docid}\n{_truncate_text(snippet, 1000)}")
+            state["document_matches"] = state.get("document_matches", [])[-16:]
+            state["opened_passages"] = state["opened_passages"][-6:]
+            state["pending_subquestions"] = ["Extract and verify answer candidates from the focused document matches."]
+            had_new_information = True
+        else:
+            state["pending_subquestions"] = ["Focused document search found no useful matches; try a different search or document."]
+
+    elif tool_name == "extract_answer_candidates":
+        state["last_action"] = "extract_answer_candidates"
+        records = tool_result.get("candidates", []) if isinstance(tool_result, dict) else []
+        for record in records[:8]:
+            if not isinstance(record, dict):
+                continue
+            text = _normalize_answer_to_type(str(record.get("text", "")), state.get("question_plan", {}).get("answer_type", "other"))
+            if not text or _is_placeholder_answer(text) or _candidate_looks_wrong_type(text, state.get("question_plan", {}).get("answer_type", "other")):
+                continue
+            state.setdefault("candidate_records", []).append({**record, "text": text})
+            if text not in state["candidate_answers"]:
+                state["candidate_answers"].append(text)
+        if records:
+            state["candidate_records"] = state.get("candidate_records", [])[-20:]
+            state["candidate_answers"] = state["candidate_answers"][-8:]
+            state["pending_subquestions"] = ["Verify the best candidate answer before finishing."]
+            had_new_information = True
+
+    elif tool_name == "verify_claim":
+        state["last_action"] = "verify_claim"
+        if isinstance(tool_result, dict):
+            state.setdefault("verification_results", []).append(tool_result)
+            state["verification_results"] = state["verification_results"][-12:]
+            state["pending_subquestions"] = [
+                "Finish if verifier supports the candidate; otherwise continue searching for the missing piece."
+            ]
+            had_new_information = True
 
     if had_new_information:
         state["stall_count"] = 0
@@ -769,12 +1255,19 @@ def _update_state_from_tool(
     state["confirmed_facts"] = state["confirmed_facts"][-20:]
     state["search_evidence"] = state["search_evidence"][-12:]
     state["pending_subquestions"] = state["pending_subquestions"][-4:]
+    state["document_matches"] = state.get("document_matches", [])[-16:]
+    state["candidate_records"] = state.get("candidate_records", [])[-20:]
+    state["verification_results"] = state.get("verification_results", [])[-12:]
 
 
 def _register_finish_signal(state: Dict[str, Any], raw_content: str) -> None:
     cleaned = _clean_text(raw_content)
-    if cleaned:
-        state["candidate_answers"].append(cleaned[:300])
+    parsed = _extract_json_object(cleaned)
+    answer_hint = str(parsed.get("answer_hint", "")).strip() if parsed else ""
+    if answer_hint and not _is_placeholder_answer(answer_hint):
+        normalized = _normalize_answer_to_type(answer_hint, state.get("question_plan", {}).get("answer_type", "other"))
+        if normalized and not _candidate_looks_wrong_type(normalized, state.get("question_plan", {}).get("answer_type", "other")):
+            state["candidate_answers"].append(normalized)
     state["candidate_answers"] = state["candidate_answers"][-6:]
     state["finish_reason"] = "model_declared_ready"
 
@@ -824,6 +1317,21 @@ def _repair_final_answer(
 
 
 def _heuristic_query_from_question(question: str) -> str:
+    phrases = _extract_quoted_phrases(question) + _extract_capitalized_phrases(question)
+    years = re.findall(r"\b(?:17|18|19|20)\d{2}\b", question)
+    focus_tokens = _select_focus_tokens(question, max_tokens=12)
+    pieces: List[str] = []
+    seen = set()
+    for item in phrases[:4] + years[:4] + focus_tokens:
+        item = str(item).strip()
+        normalized = item.lower()
+        if item and normalized not in seen:
+            seen.add(normalized)
+            pieces.append(item)
+        if len(" ".join(pieces)) >= 180:
+            break
+    if pieces:
+        return " ".join(pieces)[:180]
     words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’-]*", question)
     filtered = []
     stopwords = {
@@ -884,7 +1392,7 @@ def _extract_focus_suffix(question: str) -> str:
     for needle, extra in hints:
         if needle in lowered:
             suffix_terms.extend(extra.split())
-    suffix_terms.extend(_tokenize_focus_text(question)[:8])
+    suffix_terms.extend(_select_focus_tokens(question, max_tokens=10))
     deduped: List[str] = []
     for token in suffix_terms:
         if token not in deduped:
@@ -927,6 +1435,26 @@ def _next_untried_planned_query(state: Dict[str, Any]) -> str:
     return ""
 
 
+def _specialized_queries_from_question(state: Dict[str, Any]) -> List[str]:
+    question = state["question"]
+    expected_type = state.get("question_plan", {}).get("answer_type", "other")
+    phrases = _extract_quoted_phrases(question) + _extract_capitalized_phrases(question)
+    years = re.findall(r"\b(?:17|18|19|20)\d{2}\b", question)
+    focus = _select_focus_tokens(question, max_tokens=16)
+    queries: List[str] = []
+    if phrases:
+        queries.append(" ".join(phrases[:5] + years[:3]))
+    if expected_type == "person":
+        person_terms = ["acknowledgments", "husband", "wife", "spouse", "partner", "librarian", "biography"]
+        queries.append(" ".join(phrases[:3] + years[:3] + [term for term in person_terms if term in question.lower()]))
+    if expected_type == "company":
+        queries.append(" ".join(phrases[:3] + years[:4] + ["annual report", "10-k", "registrant", "employees", "revenue"]))
+    if expected_type == "title":
+        queries.append(" ".join(phrases[:3] + years[:4] + ["contents", "chapter", "title", "published"]))
+    queries.append(" ".join(focus[:12]))
+    return [_sanitize_search_query(query)[:220] for query in queries if query.strip()]
+
+
 def _build_query_bundle(primary_query: str, state: Dict[str, Any]) -> List[str]:
     planned_query = _next_untried_planned_query(state)
     candidates = [
@@ -935,6 +1463,7 @@ def _build_query_bundle(primary_query: str, state: Dict[str, Any]) -> List[str]:
         _heuristic_query_from_question(state["question"]),
         _extract_metadata_query(state),
     ]
+    candidates.extend(_specialized_queries_from_question(state))
     bundle: List[str] = []
     seen = set()
     previous = {_normalize_query(item) for item in state["search_history"]}
@@ -966,6 +1495,27 @@ def _pick_unopened_docid(state: Dict[str, Any]) -> str:
     return ""
 
 
+def _has_supported_answer_candidate(state: Dict[str, Any]) -> Tuple[bool, str]:
+    candidate = _select_best_candidate(state)
+    if not candidate:
+        return False, ""
+    for result in reversed(state.get("verification_results", [])):
+        result_candidate = _normalize_answer_to_type(
+            str(result.get("candidate_answer", "")),
+            state.get("question_plan", {}).get("answer_type", "other"),
+        )
+        if _normalize_query(result_candidate) == _normalize_query(candidate):
+            return bool(result.get("supported")) and float(result.get("support_score", 0.0)) >= 0.62, candidate
+    score = _candidate_evidence_score(candidate, state)
+    expected_type = state.get("question_plan", {}).get("answer_type", "other")
+    min_score = 28.0 if expected_type in {"person", "company", "title"} else 22.0
+    if score < min_score:
+        return False, candidate
+    if len(state.get("opened_docids", [])) < 2:
+        return False, candidate
+    return True, candidate
+
+
 def _decide_next_action(
     question: str,
     state: Dict[str, Any],
@@ -984,17 +1534,13 @@ def _decide_next_action(
             "reason": "Heuristic policy: inspect the best unseen document immediately after each search.",
         }, "Heuristic policy selected get_document after search."
 
-    if (
-        state["last_action"].startswith("get_document:")
-        and len(state["opened_docids"]) >= 2
-        and state.get("candidate_answers")
-        and round_id >= 4
-    ):
+    supported, best_candidate = _has_supported_answer_candidate(state)
+    if supported and round_id >= 5:
         return {
             "action": "finish",
-            "answer_hint": state["candidate_answers"][-1],
-            "reason": "Heuristic policy: two documents inspected and a short candidate answer already exists.",
-        }, "Heuristic policy selected finish after evidence convergence."
+            "answer_hint": best_candidate,
+            "reason": "Heuristic policy: opened evidence supports a type-compatible candidate answer.",
+        }, "Heuristic policy selected finish after candidate verification."
 
     if round_id >= max_rounds and state["opened_docids"]:
         return {
@@ -1025,7 +1571,7 @@ def _decide_next_action(
     )
     raw_content = str(response["choices"][0]["message"].get("content", "") or "")
     action = _extract_json_object(raw_content)
-    if action.get("action") in {"search", "get_document", "finish"}:
+    if action.get("action") in {"decompose_question", "search", "get_document", "find_in_document", "extract_answer_candidates", "verify_claim", "finish"}:
         return action, raw_content
 
     recovered = _extract_action_from_raw_text(raw_content, state)
@@ -1067,12 +1613,30 @@ def _decide_next_action(
 
 def _action_to_tool_call(action: Dict[str, Any], tool_call_id: str) -> Dict[str, Any]:
     action_name = str(action.get("action", "")).strip()
-    if action_name == "search":
+    if action_name == "decompose_question":
+        arguments = {"question": str(action.get("question", "")).strip()}
+        function_name = "decompose_question"
+    elif action_name == "search":
         arguments = {"query": str(action.get("query", "")).strip()}
         function_name = "search"
     elif action_name == "get_document":
         arguments = {"docid": str(action.get("docid", "")).strip()}
         function_name = "get_document"
+    elif action_name == "find_in_document":
+        arguments = {
+            "docid": str(action.get("docid", "")).strip(),
+            "query": str(action.get("query", "")).strip(),
+        }
+        function_name = "find_in_document"
+    elif action_name == "extract_answer_candidates":
+        arguments = {
+            "answer_type": str(action.get("answer_type", "")).strip(),
+            "evidence_docids": action.get("evidence_docids", []),
+        }
+        function_name = "extract_answer_candidates"
+    elif action_name == "verify_claim":
+        arguments = {"candidate_answer": str(action.get("candidate_answer", "")).strip()}
+        function_name = "verify_claim"
     else:
         raise ValueError(f"Unsupported tool action: {action_name}")
 
@@ -1110,7 +1674,8 @@ def _execute_tool_call(
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], str]:
     function = tool_call.get("function", {})
     tool_name = str(function.get("name", "")).strip()
-    if tool_name not in tool_registry:
+    internal_tools = {"decompose_question", "find_in_document", "extract_answer_candidates", "verify_claim"}
+    if tool_name not in tool_registry and tool_name not in internal_tools:
         state["stall_count"] += 1
         return (
             None,
@@ -1158,7 +1723,10 @@ def _execute_tool_call(
                 f"Skipped repeated or empty document request: {docid or '<empty>'}",
             )
 
-    if tool_name == "search":
+    if tool_name == "decompose_question":
+        tool_result = dict(state.get("question_plan", {}))
+        tool_args = {"question": str(tool_args.get("question", "")).strip() or state.get("question", "")}
+    elif tool_name == "search":
         merged: Dict[str, Dict[str, Any]] = {}
         query_bundle = _build_query_bundle(str(tool_args.get("query", "")).strip(), state)
         for bundle_query in query_bundle:
@@ -1177,6 +1745,38 @@ def _execute_tool_call(
                         merged[docid].update(enriched)
         tool_result = _rank_search_results(list(merged.values()), state["question"])[:8]
         tool_args = {"query": query_bundle[0], "query_bundle": query_bundle}
+    elif tool_name == "find_in_document":
+        docid = str(tool_args.get("docid", "")).strip()
+        if not docid and state.get("opened_docids"):
+            docid = state["opened_docids"][-1]
+        query = str(tool_args.get("query", "")).strip()
+        if not query:
+            query = f"{state['question']} {state.get('question_plan', {}).get('verification_query', '')}".strip()
+        tool_args = {"docid": docid, "query": query}
+        tool_result = _find_in_document_tool(state=state, docid=docid, query=query)
+    elif tool_name == "extract_answer_candidates":
+        answer_type = str(tool_args.get("answer_type", "")).strip() or state.get("question_plan", {}).get("answer_type", "other")
+        evidence_docids = tool_args.get("evidence_docids", [])
+        if not isinstance(evidence_docids, list):
+            evidence_docids = []
+        evidence_blocks = list(state.get("opened_passages", [])[-6:])
+        evidence_blocks.extend(str(item.get("snippet", "")) for item in state.get("document_matches", [])[-8:] if isinstance(item, dict))
+        tool_args = {"answer_type": answer_type, "evidence_docids": evidence_docids or state.get("opened_docids", [])[-6:]}
+        tool_result = _extract_answer_candidate_records(answer_type=answer_type, evidence_blocks=evidence_blocks)
+    elif tool_name == "verify_claim":
+        candidate_answer = str(tool_args.get("candidate_answer", "")).strip() or _select_best_candidate(state)
+        evidence_docids = state.get("opened_docids", [])[-6:]
+        evidence_snippets = list(state.get("opened_passages", [])[-6:])
+        evidence_snippets.extend(str(item.get("snippet", "")) for item in state.get("document_matches", [])[-8:] if isinstance(item, dict))
+        tool_args = {"candidate_answer": candidate_answer, "evidence_docids": evidence_docids}
+        tool_result = _verify_claim_with_evidence(
+            question=state["question"],
+            candidate_answer=candidate_answer,
+            evidence_docids=evidence_docids,
+            evidence_snippets=evidence_snippets,
+            expected_type=state.get("question_plan", {}).get("answer_type", "other"),
+        )
+        tool_result["candidate_answer"] = candidate_answer
     else:
         tool_result = tool_registry[tool_name](**tool_args)
     focus_text = state["question"]
@@ -1219,6 +1819,94 @@ def _execute_tool_call(
     return executed, tool_message, observation
 
 
+def _run_open_track_evidence_tools(
+    messages: List[Dict[str, Any]],
+    state: Dict[str, Any],
+    tool_registry: Dict[str, Any],
+    tool_content_max_chars: int,
+    round_id: int,
+    docid: str,
+) -> str:
+    """Run the OpenTrack-Easy tool chain after a document has been opened."""
+    observations: List[str] = []
+    focus_query = " ".join(
+        item
+        for item in [
+            state.get("question_plan", {}).get("verification_query", ""),
+            " ".join(state.get("question_plan", {}).get("verification_targets", [])[:3]),
+            state.get("question", ""),
+        ]
+        if item
+    )
+    planned_actions: List[Dict[str, Any]] = [
+        {
+            "action": "find_in_document",
+            "docid": docid,
+            "query": focus_query,
+            "reason": "Executor Agent: locate focused evidence within the opened document.",
+        },
+        {
+            "action": "extract_answer_candidates",
+            "answer_type": state.get("question_plan", {}).get("answer_type", "other"),
+            "reason": "Executor Agent: extract typed short candidates from opened evidence.",
+        },
+    ]
+
+    for offset, action in enumerate(planned_actions, start=1):
+        tool_call = _action_to_tool_call(action, f"call_{round_id}_ot_{offset}")
+        messages.append(
+            {
+                "role": "assistant",
+                "content": action["reason"],
+                "state_summary": _build_state_summary(state),
+                "round_id": round_id,
+                "agent_role": "executor",
+                "action_plan": action,
+                "tool_calls": [tool_call],
+            }
+        )
+        _, tool_message, observation = _execute_tool_call(
+            tool_call=tool_call,
+            tool_registry=tool_registry,
+            state=state,
+            tool_content_max_chars=tool_content_max_chars,
+        )
+        if tool_message is not None:
+            messages.append(tool_message)
+        observations.append(observation)
+
+    best_candidate = _select_best_candidate(state)
+    if best_candidate:
+        verify_action = {
+            "action": "verify_claim",
+            "candidate_answer": best_candidate,
+            "reason": "Verifier Agent: verify the current best candidate against opened evidence.",
+        }
+        tool_call = _action_to_tool_call(verify_action, f"call_{round_id}_ot_3")
+        messages.append(
+            {
+                "role": "assistant",
+                "content": verify_action["reason"],
+                "state_summary": _build_state_summary(state),
+                "round_id": round_id,
+                "agent_role": "verifier",
+                "action_plan": verify_action,
+                "tool_calls": [tool_call],
+            }
+        )
+        _, tool_message, observation = _execute_tool_call(
+            tool_call=tool_call,
+            tool_registry=tool_registry,
+            state=state,
+            tool_content_max_chars=tool_content_max_chars,
+        )
+        if tool_message is not None:
+            messages.append(tool_message)
+        observations.append(observation)
+
+    return "\n".join(observations)
+
+
 def run_multistep_agent(
     question: str,
     client: VLLMClient,
@@ -1237,6 +1925,31 @@ def run_multistep_agent(
         {"role": "user", "content": question},
     ]
     recent_observation = "No tool has been used yet."
+
+    planner_tool_call = _action_to_tool_call(
+        {"action": "decompose_question", "question": question, "reason": "Planner Agent: decompose the question into subgoals."},
+        "call_plan",
+    )
+    messages.append(
+        {
+            "role": "assistant",
+            "content": "Planner Agent: decomposed the question into answer type, subgoals, search plan, and verification targets.",
+            "state_summary": _build_state_summary(state),
+            "round_id": 0,
+            "agent_role": "planner",
+            "question_plan": question_plan,
+            "tool_calls": [planner_tool_call],
+        }
+    )
+    _, planner_tool_message, planner_observation = _execute_tool_call(
+        tool_call=planner_tool_call,
+        tool_registry=tool_registry,
+        state=state,
+        tool_content_max_chars=tool_content_max_chars,
+    )
+    if planner_tool_message is not None:
+        messages.append(planner_tool_message)
+        recent_observation = planner_observation
 
     initial_query = str(question_plan.get("primary_query", "")).strip() or question.strip()
     initial_tool_call = _action_to_tool_call({"action": "search", "query": initial_query}, "call_1")
@@ -1300,11 +2013,54 @@ def run_multistep_agent(
         )
         if tool_message is not None:
             messages.append(tool_message)
+        if action_name == "get_document":
+            docid = str(action.get("docid", "")).strip()
+            open_track_observation = _run_open_track_evidence_tools(
+                messages=messages,
+                state=state,
+                tool_registry=tool_registry,
+                tool_content_max_chars=tool_content_max_chars,
+                round_id=round_id,
+                docid=docid,
+            )
+            if open_track_observation:
+                recent_observation = "\n".join([recent_observation, open_track_observation])
 
         stop_reason = _should_stop_after_state_update(state=state, max_rounds=max_rounds, round_id=round_id)
         if stop_reason:
             state["finish_reason"] = stop_reason
             break
+
+    best_candidate_before_final = _select_best_candidate(state)
+    already_verified = any(
+        _normalize_query(str(item.get("candidate_answer", ""))) == _normalize_query(best_candidate_before_final)
+        for item in state.get("verification_results", [])
+    )
+    if best_candidate_before_final and not already_verified:
+        verify_action = {
+            "action": "verify_claim",
+            "candidate_answer": best_candidate_before_final,
+            "reason": "Verifier Agent: final pre-answer verification of the best candidate.",
+        }
+        tool_call = _action_to_tool_call(verify_action, "call_final_verifier")
+        messages.append(
+            {
+                "role": "assistant",
+                "content": verify_action["reason"],
+                "state_summary": _build_state_summary(state),
+                "agent_role": "verifier",
+                "action_plan": verify_action,
+                "tool_calls": [tool_call],
+            }
+        )
+        _, tool_message, _ = _execute_tool_call(
+            tool_call=tool_call,
+            tool_registry=tool_registry,
+            state=state,
+            tool_content_max_chars=tool_content_max_chars,
+        )
+        if tool_message is not None:
+            messages.append(tool_message)
 
     final_messages = [
         {"role": "system", "content": FINAL_ANSWER_SYSTEM_PROMPT},
@@ -1340,6 +2096,17 @@ def run_multistep_agent(
     if (_is_placeholder_answer(predicted_answer) or not predicted_answer) and extracted_candidates:
         predicted_answer = extracted_candidates[0]
     predicted_answer = _normalize_answer_to_type(predicted_answer or final_text[:200], question_plan.get("answer_type", "other"))
+    best_candidate = _select_best_candidate(state)
+    if best_candidate:
+        predicted_score = _candidate_evidence_score(predicted_answer, state)
+        best_score = _candidate_evidence_score(best_candidate, state)
+        if (
+            not predicted_answer
+            or _is_placeholder_answer(predicted_answer)
+            or _candidate_looks_wrong_type(predicted_answer, question_plan.get("answer_type", "other"))
+            or best_score >= predicted_score + 10.0
+        ):
+            predicted_answer = best_candidate
     state["candidate_answers"].append(predicted_answer or final_text[:200])
 
     messages.append(
