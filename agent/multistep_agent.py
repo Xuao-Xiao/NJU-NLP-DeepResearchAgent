@@ -645,7 +645,6 @@ def _candidate_looks_wrong_type(candidate: str, expected_type: str) -> bool:
             "student", "faculty", "appointment", "council", "regulations", "policy",
             "supervisory", "committee", "supervisor", "research supervisor",
             "graduate", "studies", "funding", "access", "investigation",
-            "doctoral degree", "doctoral thesis", "major research paper", "portfolio thesis",
         }
         if candidate_for_shape.isupper():
             return True
@@ -1752,8 +1751,6 @@ def _score_search_result(item: Dict[str, Any], focus_text: str) -> float:
         if any(term in lowered_focus for term in ["supervised", "supervisor", "field research", "master's"]):
             if any(term in haystack for term in ["supervisor", "supervised", "field research", "master's thesis", "master of arts", "thesis advisor"]):
                 score += 18.0
-            if any(term in haystack for term in ["graduate student supervisory committee policy", "supervisor guidelines", "doctoral thesis", "the master's degree", "general requirements"]):
-                score -= 24.0
         if any(term in haystack for term in ["authorship", "faq", "submission guidelines"]):
             score -= 10.0
 
@@ -1784,30 +1781,20 @@ def _score_search_result(item: Dict[str, Any], focus_text: str) -> float:
     if any(term in lowered_focus for term in ["name of the club", "club opened", "latin music", "sound system"]):
         if any(term in haystack for term in ["club", "latin music", "sound system", "seven nights", "discotheque", "billboard"]):
             score += 22.0
-        if any(term in haystack for term in ["billboard publication", "music-record-tape newsweekly", "april 19, 1975", "latin legend", "west coast"]):
-            score += 18.0
         if any(term in haystack for term in ["manchester united", "glazers to jim ratcliffe", "ineos", "premier league"]):
             score -= 28.0
         if re.search(r"\b(?:best|top)\s+\d+\b", haystack) and "club" in haystack:
             score -= 22.0
-        if any(term in haystack for term in ["buddy guy", "blues club owner", "jazz in san francisco", "keith thurman"]):
-            score -= 18.0
 
     if "nationality" in lowered_focus:
         if any(term in haystack for term in ["journalist", "reporter", "correspondent", "novel", "research"]):
             score += 18.0
         if any(term in haystack for term in ["broadcasting corporation", "national political correspondent", "documentary reporter"]):
             score += 12.0
-        if any(term in haystack for term in ["best spy books", "spy novels", "espionage fiction", "spy thrillers", "spy fans"]):
-            score -= 36.0
 
     if any(term in lowered_focus for term in ["scientific name", "genus", "species", "beetle", "wrongly identified", "misidentified"]):
         if any(term in haystack for term in ["wrongly identified", "misidentified", "beetle", "invasive", "species", "abstract"]):
             score += 18.0
-        if any(term in haystack for term in ["first noted in 1916", "late 1960s", "nationwide", "non-native country"]):
-            score += 18.0
-        if any(term in haystack for term in ["emerald ash borer", "ash borer", "harmless bug", "oregon for"]):
-            score -= 20.0
 
     if any(term in lowered_focus for term in ["redox biology", "pulmonary fibrosis", "bleomycin", "mrc-5", "ferroptosis"]):
         if any(term in haystack for term in ["pulmonary fibrosis", "bleomycin", "mrc-5", "ferroptosis", "iron accumulation", "redox biology"]):
@@ -2499,7 +2486,6 @@ def _specialized_queries_from_question(state: Dict[str, Any]) -> List[str]:
         if any(term in lowered_question for term in ["name of the club", "latin music", "sound system", "seven nights"]):
             queries.append(" ".join(["West Coast", "club", "Latin music", "seven nights", "sound system", "weekly magazine", "DJ", "Filipino southpaw"]))
             queries.append(" ".join(["club opened", "Latin music", "four syllables", "begins with B", "sound system", "Billboard", "1970s"]))
-            queries.append(" ".join(["Billboard", "1975", "West Coast", "Latin music", "seven nights", "sound system", "club begins B"]))
     if expected_type == "organization":
         if "scholarship" in lowered_question:
             queries.append(" ".join(["scholarship", "provided by", "ministry", "department", "research paper", "1964", "2004", "museum Los Angeles"] + years[:4]))
@@ -2510,11 +2496,9 @@ def _specialized_queries_from_question(state: Dict[str, Any]) -> List[str]:
     if expected_type == "other" and "nationality" in lowered_question:
         queries.append(" ".join(["journalist", "nationality", "research", "novel", "spy", "handler", "grandchild", "2014", "archived documents"]))
         queries.append(" ".join(["journalist", "research for a novel", "national political correspondent", "reporter", "spy"]))
-        queries.append(" ".join(["spy", "helped journalist", "research for a novel", "nationality", "grandchild", "archived documents"]))
     if expected_type == "other" and any(term in lowered_question for term in ["scientific name", "genus and species", "wrongly identified", "beetle species"]):
         queries.append(" ".join(["invasive beetle", "wrongly identified", "scientific name", "genus species", "1916", "June 2 2017"]))
         queries.append(" ".join(["beetle species", "first noted 1916", "late 1960s", "misidentified", "abstract"]))
-        queries.append(" ".join(["invasive beetle", "1916", "late 1960s", "wrongly identified", "genus species", "nationwide"]))
     if expected_type == "other" and any(term in lowered_question for term in ["height", "width", "length", "diameter", "centimet", " cm", "stand"]):
         measurement_terms = [term for term in ["dimensions", "height", "width", "stand", "pottery", "object", "museum"] if term in question.lower() or term in {"dimensions", "object"}]
         queries.append(" ".join(phrases[:3] + years[:4] + measurement_terms))
