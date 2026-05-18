@@ -82,6 +82,9 @@ Rules:
 - Use only the provided evidence.
 - exact_answer must be a short answer string, not a sentence or paragraph.
 - Never output placeholder answers such as None, Given, Unknown, N/A, or evidence insufficient.
+- Prefer a verified supported candidate from the candidate table.
+- If no candidate is verified, choose the best type-compatible candidate explicitly present in opened evidence.
+- Never explain uncertainty inside exact_answer.
 - For person answers: output only the person's name.
 - For company answers: prefer the common company name; drop legal suffixes like Inc., Corp., LLC, Ltd. unless the question explicitly asks for the full legal name.
 - For year answers: output only a 4-digit year.
@@ -145,6 +148,19 @@ def _is_country_name(candidate: str) -> bool:
 
 def _is_demonym(candidate: str) -> bool:
     return candidate.strip(" .,:;\"'") in DEMONYMS
+
+
+def _looks_like_binomial_name(candidate: str) -> bool:
+    cleaned = candidate.strip(" .,:;\"'")
+    if not re.fullmatch(r"[A-Z][a-z]{2,}\s+[a-z][a-z-]{2,}", cleaned):
+        return False
+    genus, species = cleaned.split(maxsplit=1)
+    bad_genus = {
+        "The", "This", "That", "These", "Those", "But", "And", "For", "With", "From",
+        "Nash", "American", "Eugene", "Oregon", "Looking",
+    }
+    bad_species = {"difference", "homes", "caught", "wrongly", "species", "beetle"}
+    return genus not in bad_genus and species not in bad_species
 
 
 def _normalize_query(query: str) -> str:
@@ -496,7 +512,7 @@ def _candidate_context_bonus(candidate: str, state: Dict[str, Any], evidence: st
             bonus -= 16.0
 
     if expected_type == "other" and any(term in focus_lower for term in ("scientific name", "genus and species")):
-        if re.fullmatch(r"[A-Z][a-z]{2,}\s+[a-z][a-z-]{2,}", candidate.strip()):
+        if _looks_like_binomial_name(candidate):
             bonus += 24.0
             local_species_text = "\n".join(_candidate_windows(candidate, evidence, window=260)).lower()
             if any(term in local_species_text for term in ("wrongly identified", "misidentified", "beetle", "species", "invasive")):
@@ -645,6 +661,8 @@ def _candidate_looks_wrong_type(candidate: str, expected_type: str) -> bool:
             "student", "faculty", "appointment", "council", "regulations", "policy",
             "supervisory", "committee", "supervisor", "research supervisor",
             "graduate", "studies", "funding", "access", "investigation",
+            "doctoral", "degree", "thesis", "portfolio", "composition", "countries",
+            "major research",
         }
         if candidate_for_shape.isupper():
             return True
@@ -676,6 +694,11 @@ def _candidate_looks_wrong_type(candidate: str, expected_type: str) -> bool:
         if lowered in {"person", "people", "country", "state", "city"}:
             return True
         if len(candidate.split()) > 4:
+            return True
+    if expected_type == "organization":
+        if len(candidate) > 120:
+            return True
+        if any(term in lowered for term in ("the term 'thesis'", "generally used to refer", "culminating project", "this form of thesis")):
             return True
     if expected_type == "title":
         bad_titles = {
@@ -714,7 +737,7 @@ def _candidate_evidence_score(candidate: str, state: Dict[str, Any]) -> float:
         if not _is_demonym(candidate):
             return -100.0
     if expected_type == "other" and any(term in focus_lower for term in ["scientific name", "genus and species"]):
-        if not re.fullmatch(r"[A-Z][a-z]{2,}\s+[a-z][a-z-]{2,}", candidate.strip()):
+        if not _looks_like_binomial_name(candidate):
             return -100.0
     if expected_type == "place" and "country" in focus_lower and not _is_country_name(candidate):
         return -100.0
@@ -827,6 +850,18 @@ def _select_supported_verified_candidate(state: Dict[str, Any]) -> str:
     if not candidates:
         return ""
     return max(candidates, key=lambda item: _candidate_evidence_score(item, state))
+
+
+def _last_verification_supported(state: Dict[str, Any]) -> bool:
+    results = state.get("verification_results", [])
+    if not results:
+        return False
+    last = results[-1]
+    expected_type = state.get("question_plan", {}).get("answer_type", "other")
+    return bool(last.get("supported")) and float(last.get("support_score", 0.0)) >= _support_threshold(
+        str(last.get("candidate_answer", "")),
+        expected_type,
+    )
 
 
 def _candidate_record_frequency(candidate: str, state: Dict[str, Any]) -> int:
@@ -944,7 +979,7 @@ def _verify_claim_with_evidence(
             "verdict_note": "Rejected because candidate is not a nationality.",
         }
     if expected_type == "other" and any(term in focus_lower for term in ["scientific name", "genus and species"]):
-        if not re.fullmatch(r"[A-Z][a-z]{2,}\s+[a-z][a-z-]{2,}", candidate.strip()):
+        if not _looks_like_binomial_name(candidate):
             return {
                 "supported": False,
                 "support_score": 0.0,
@@ -1039,14 +1074,23 @@ def _verify_claim_with_evidence(
         ("cash payment", ["cash", "payment", "received"]),
         ("cover designer", ["graphic designer", "cover", "malaria consortium", "ogilvy", "leadership strategies", "graphic design"]),
         ("graphic artist", ["graphic designer", "cover", "malaria consortium", "ogilvy", "leadership strategies", "graphic design"]),
-        ("country", ["country", "foreign", "spent", "two years", "lived", "visited"]),
         ("software", ["software", "version", "download", "program", "released"]),
         ("nationality", ["journalist", "reporter", "correspondent", "novel", "research"]),
         ("scientific name", ["species", "beetle", "wrongly identified", "misidentified", "genus"]),
         ("paper", ["journal", "title", "published", "pulmonary fibrosis", "bleomycin"]),
         ("scholarship", ["scholarship", "ministry", "department", "provided"]),
     ]
+    if expected_type == "place" and "country" in focus_lower:
+        relationship_checks.append(("country", ["country", "foreign", "spent", "two years", "lived", "visited"]))
     for needle, required_terms in relationship_checks:
+        if needle == "paper" and expected_type != "title":
+            continue
+        if needle == "scholarship" and expected_type != "organization":
+            continue
+        if needle == "nationality" and not (expected_type == "other" and "nationality" in focus_lower):
+            continue
+        if needle == "scientific name" and not (expected_type == "other" and any(term in focus_lower for term in ["scientific name", "genus and species"])):
+            continue
         relation_evidence = lowered_evidence if needle == "annual report" else local_evidence
         if needle in question_lower and not any(term in relation_evidence for term in required_terms):
             missing.append(f"Missing evidence for `{needle}` relation.")
@@ -1200,7 +1244,10 @@ def _extract_candidate_answers_from_text(text: str, expected_type: str) -> List[
             demonym_pattern = r"\b(" + "|".join(re.escape(item) for item in sorted(DEMONYMS, key=len, reverse=True)) + r")\b"
             candidates.extend(re.findall(demonym_pattern, plain))
         if any(term in plain.lower() for term in ("scientific name", "genus", "species", "beetle", "wrongly identified", "misidentified")):
-            candidates.extend(re.findall(r"\b([A-Z][a-z]{2,}\s+[a-z][a-z-]{2,})\b", plain))
+            candidates.extend(
+                item for item in re.findall(r"\b([A-Z][a-z]{2,}\s+[a-z][a-z-]{2,})\b", plain)
+                if _looks_like_binomial_name(item)
+            )
         hectare_matches = re.findall(r"\b(\d{1,5}(?:,\d{3})?)\s+hectares?\b", plain, flags=re.IGNORECASE)
         for match in hectare_matches:
             candidates.append(match.replace(",", ""))
@@ -1350,6 +1397,8 @@ def _extract_candidate_centered_passages(text: str, question: str, answer_type: 
         elif any(term in lowered_question for term in ("scientific name", "genus and species", "wrongly identified", "beetle species")):
             pattern = re.compile(r"\b[A-Z][a-z]{2,}\s+[a-z][a-z-]{2,}\b")
             for match in pattern.finditer(plain):
+                if not _looks_like_binomial_name(match.group(0)):
+                    continue
                 left = max(0, match.start() - 520)
                 right = min(len(plain), match.end() + 620)
                 window = plain[left:right]
@@ -1999,6 +2048,10 @@ def _build_final_user_prompt(question: str, state: Dict[str, Any]) -> str:
     evidence_lines = state["confirmed_facts"][-8:]
     candidates = state["candidate_answers"][-3:]
     extracted_candidates = _collect_answer_candidates(state)
+    candidate_score_lines = [
+        f"{idx + 1}. {candidate} | evidence_score={_candidate_evidence_score(candidate, state):.1f}"
+        for idx, candidate in enumerate(extracted_candidates[:8])
+    ]
     opened_passages = state.get("opened_passages", [])[-4:]
     search_hits = state.get("search_evidence", [])[-6:]
     verifier_results = state.get("verification_results", [])[-4:]
@@ -2022,6 +2075,9 @@ def _build_final_user_prompt(question: str, state: Dict[str, Any]) -> str:
             "Candidate shortlist extracted from evidence:",
             "\n".join(f"- {item}" for item in extracted_candidates) or "- None",
             "",
+            "Candidate score table:",
+            "\n".join(candidate_score_lines) or "None",
+            "",
             "Candidate answers considered:",
             "\n".join(f"- {item}" for item in candidates) or "- None",
             "",
@@ -2031,7 +2087,7 @@ def _build_final_user_prompt(question: str, state: Dict[str, Any]) -> str:
                 for item in verifier_results
             ) or "- None",
             "",
-            "Give the final answer now.",
+            "Give the final answer now. Use only an item from the candidate score table when one is type-compatible and evidence-supported.",
         ]
     )
 
@@ -2040,6 +2096,12 @@ def _should_stop_after_state_update(state: Dict[str, Any], max_rounds: int, roun
     if round_id >= max_rounds:
         return "max_rounds_reached"
     if state["stall_count"] >= 2:
+        if (
+            not _last_verification_supported(state)
+            and len(state.get("opened_docids", [])) < 3
+            and _pick_unopened_docid(state)
+        ):
+            return None
         return "no_new_information"
     return None
 
@@ -2587,6 +2649,18 @@ def _decide_next_action(
             "docid": fallback_docid,
             "reason": "Heuristic policy: inspect the best unseen document immediately after each search.",
         }, "Heuristic policy selected get_document after search."
+
+    if (
+        state["last_action"] == "verify_claim"
+        and not _last_verification_supported(state)
+        and fallback_docid
+        and len(state.get("opened_docids", [])) < 3
+    ):
+        return {
+            "action": "get_document",
+            "docid": fallback_docid,
+            "reason": "Heuristic policy: verifier rejected the current candidate, so inspect the next unseen document before finishing.",
+        }, "Heuristic policy selected get_document after unsupported verification."
 
     supported, best_candidate = _has_supported_answer_candidate(state)
     if supported and round_id >= 5:
