@@ -57,6 +57,24 @@ def _build_eval_user_message(gold_answer: str, predicted_answer: str, question: 
     return "\n".join(parts)
 
 
+def _normalize_for_exact_match(answer: str) -> str:
+    cleaned = str(answer or "").strip().lower()
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = cleaned.strip(" .,:;\"'")
+    cleaned = re.sub(r"\s*%\s*$", "%", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
+
+
+def _deterministic_equivalence(gold_answer: str, predicted_answer: str) -> Tuple[Optional[str], str]:
+    gold_norm = _normalize_for_exact_match(gold_answer)
+    pred_norm = _normalize_for_exact_match(predicted_answer)
+    if gold_norm and pred_norm and gold_norm == pred_norm:
+        return "CORRECT", "Normalized predicted answer exactly matches the gold answer."
+    return None, ""
+
+
 def _parse_eval_response(response_text: str) -> Tuple[str, str]:
     """Parse the eval model's response, returning (judgment, reasoning)."""
     judgment = "INCORRECT"
@@ -208,25 +226,31 @@ def run_evaluation(
             reasoning = "No predicted answer found in submission."
         else:
             # 调用 eval 模型
-            eval_messages = [
-                {"role": "system", "content": EVAL_SYSTEM_PROMPT},
-                {"role": "user", "content": _build_eval_user_message(gold_answer, predicted_answer, question)},
-            ]
-            try:
-                response = client.simple_chat(
-                    model=model_name,
-                    messages=eval_messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                eval_text = response["choices"][0]["message"]["content"]
-                judgment, reasoning = _parse_eval_response(eval_text)
-            except Exception as e:
-                if verbose:
-                    print(f"[ERROR] query_id={query_id}: eval model call failed: {e}")
-                eval_text = f"ERROR: {e}"
-                judgment = "INCORRECT"
-                reasoning = str(e)
+            deterministic_judgment, deterministic_reasoning = _deterministic_equivalence(gold_answer, predicted_answer)
+            if deterministic_judgment:
+                judgment = deterministic_judgment
+                reasoning = deterministic_reasoning
+                eval_text = f"Judgment: {judgment}\nReasoning: {reasoning}"
+            else:
+                eval_messages = [
+                    {"role": "system", "content": EVAL_SYSTEM_PROMPT},
+                    {"role": "user", "content": _build_eval_user_message(gold_answer, predicted_answer, question)},
+                ]
+                try:
+                    response = client.simple_chat(
+                        model=model_name,
+                        messages=eval_messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                    eval_text = response["choices"][0]["message"]["content"]
+                    judgment, reasoning = _parse_eval_response(eval_text)
+                except Exception as e:
+                    if verbose:
+                        print(f"[ERROR] query_id={query_id}: eval model call failed: {e}")
+                    eval_text = f"ERROR: {e}"
+                    judgment = "INCORRECT"
+                    reasoning = str(e)
 
         if judgment == "CORRECT":
             correct_count += 1
