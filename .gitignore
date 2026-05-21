@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+# Fine-tuning artifacts should stay on the cloud server, not in Git.
+open_track_finetune/
+finetuning/data/
+finetuning/outputs/
+finetuning/runs/
+finetuning/*.jsonl
+

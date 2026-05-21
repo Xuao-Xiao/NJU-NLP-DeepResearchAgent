@@ -348,25 +348,37 @@ python -m agent.eval \
 - 失败轨迹
 - 可用于训练或分析的对话与工具调用数据
 
+当前结论：
+
+- `OTEasyRun0.11_22` 只有 `11/50` 正确。
+- 历史 run 的正确题并集也只有 `12` 道。
+- 这些轨迹不足以支撑正式微调，只能作为数据格式 seed、smoke test 和回归保护集。
+- 真正训练应优先从 BrowseComp-Plus 离线语料构造合规人造任务，再用当前 agent 生成 teacher trajectories。
+
 #### 阶段 G：云端训练
 
 在云端进行：
 
-- SFT
-- 可能的 RL
-- 模型 checkpoint 保存
+- LoRA SFT，作为第一优先路线
+- 可选 DPO/ORPO，只有 SFT 稳定有效后再考虑
+- RL 仅作为后续方向，不作为第一版目标
+- LoRA adapter、merged checkpoint 和训练日志保存
 
 说明：
 
 - 训练应在华为云 Linux 云机上完成
 - 大规模训练数据和 checkpoint 可以持久化保存在云端
+- 华为 `NPU 910B` 不使用 NVIDIA CUDA；训练应优先走 Ascend/CANN/`torch_npu` 适配路线
+- 第一版不建议 QLoRA、AdaLoRA 或全量 SFT
 
 #### 阶段 H：训练后重新部署与评测
 
-1. 用训练后的模型重新启动 `vLLM`
+1. 用 LoRA adapter 或合并后的模型重新启动 `vLLM`
 2. 重新生成 `submission.jsonl`
 3. 重新运行自动评测
 4. 对比 baseline 与训练后模型结果
+
+原则上不改 [agent_vllm_multistep.ipynb](/D:/nju-nlp-deep-research/agent_vllm_multistep.ipynb:113) 和 [agent/eval.py](/D:/nju-nlp-deep-research/agent/eval.py:150)，只切换模型服务。最好保持 OpenAI-compatible endpoint 和 `served-model-name` 不变，使对照实验只改变模型权重。
 
 #### 阶段 I：Open Track 补充材料
 
@@ -454,23 +466,36 @@ python -m agent.eval \
 
 设计概况：
 
-- 微调属于最后阶段，在主赛道和 Open Track 轻量增强稳定后再做
-- 训练数据优先来自自采集 agent 轨迹，而不是测试集答案
-- 先做 SFT，再决定是否需要 RL
-- 微调目标不是泛泛提升，而是学习更有效的查询改写、文档展开和停止策略
+- 微调属于最后阶段，当前详细方案见 [Documents/OpenTrack-FineTuning.md](/D:/nju-nlp-deep-research/Documents/OpenTrack-FineTuning.md)
+- 现有 11 条成功轨迹太少，只能用于 schema 验证、smoke test 和稳定题回归
+- 正式训练数据应通过 BrowseComp-Plus 离线语料构造合规人造任务，再由当前 agent 生成 teacher trajectories
+- 第一版采用 LoRA SFT；不做全量 SFT，不把 QLoRA/AdaLoRA/RL 作为第一选择
+- 训练目标是 agent 行为：动作决策、query 改写、文档选择、文档内定位、候选验证和最终短答案格式
+- 微调代码与 `agent/multistep_agent.py` 解耦，建议新建 `finetuning/` 目录管理数据抽取、训练配置、adapter 部署和实验日志
+- 云端评测入口原则上不改，只通过重新部署 base/adapter/merged model 做对照
 
 ## 4. 当前阶段行动清单
 
-在本文档下一轮更新前，当前优先事项应为：
+当前微调工程骨架已经落地，相关入口集中在 [finetuning/README.md](/D:/nju-nlp-deep-research/finetuning/README.md)。
 
-1. 在华为云 Linux 云机上跑通依赖安装
-2. 在云端下载并启动 `Qwen3-8B + vLLM`
-3. 在云端构建 BM25 索引
-4. 跑通 `agent_vllm.ipynb` 或等价脚本
-5. 生成第一版 `submission.jsonl`
-6. 跑通 `agent.eval`
-7. 确认主赛道完整最小闭环可用
-8. 再回到本文档第 3 节补充具体设计
+已经完成：
+
+1. 新建 `finetuning/`，实现轨迹到 SFT 样本的数据抽取和检查脚本。
+2. 从 `OTEasyRun0.11_22` 抽取小样例，验证 schema 和过滤规则。
+3. 实现 BrowseComp-Plus 合成人造任务生成器，不使用测试集 gold answer。
+4. 实现 teacher trajectories 运行入口、合成 oracle 评测、SFT 合并/过滤/切分入口。
+5. 实现项目自有 LoRA SFT 训练入口 [finetuning/train.py](/D:/nju-nlp-deep-research/finetuning/train.py) 和推荐配置。
+
+下一步在云端执行：
+
+1. 保持 OpenTrack-Easy 定版 `OTEasyRun0.11_22` 作为当前稳定对照。
+2. 在云端生成较大 `synthetic_tasks.jsonl`，不要提交到 GitHub。
+3. 在云端用当前 agent 跑 synthetic teacher trajectories。
+4. 过滤得到第一版 `sft_train/dev/heldout.jsonl`。
+5. 第一次真实训练前，回传过滤后数据或至少回传 `inspect_sft_data` 输出做质量确认。
+6. 在华为云 Ascend 910B 上用 [finetuning/train.py](/D:/nju-nlp-deep-research/finetuning/train.py) 或已配置好的 `ms-swift` / `LLaMA-Factory` 跑 LoRA SFT smoke test。
+7. 重新部署 adapter 或 merged model，用同一 notebook 和 eval 入口评测。
+8. 对比 base、OpenTrack-Easy、LoRA SFT 三组结果，并检查 11 道稳定正确题是否回退。
 
 ## 5. 文档维护规则
 
