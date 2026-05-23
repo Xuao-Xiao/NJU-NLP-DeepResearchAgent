@@ -11,6 +11,78 @@ from .common import compact_text, stable_id, write_jsonl
 
 FRONT_MATTER_RE = re.compile(r"\A---\s*\n(?P<body>.*?)\n---\s*", re.DOTALL)
 HEADING_RE = re.compile(r"^(#{1,3})\s+(.+?)\s*$", re.MULTILINE)
+KEY_VALUE_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_ /-]{1,40}):\s*(.+?)\s*$", re.MULTILINE)
+PERSON_HEADING_RE = re.compile(
+    r"(?m)^(?P<name>(?:(?:Dr|Prof|Professor)\.?\s+)?[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})\s*$"
+)
+
+FIELD_PRIORITY = [
+    "country",
+    "type",
+    "established",
+    "chancellor",
+    "vice_chancellor",
+    "city",
+    "state",
+    "campus_size",
+    "budget",
+    "students",
+    "faculty",
+    "birth_date",
+    "nationality",
+    "occupation",
+    "known_for",
+]
+SKIP_FIELD_KEYS = {
+    "title",
+    "author",
+    "date",
+    "image",
+    "image_upright",
+    "logo",
+    "logo_size",
+    "website",
+}
+COUNTRY_NAMES = [
+    "Australia",
+    "United States",
+    "United Kingdom",
+    "Canada",
+    "Germany",
+    "France",
+    "Japan",
+    "China",
+    "India",
+    "Italy",
+    "Spain",
+    "Brazil",
+    "South Africa",
+    "New Zealand",
+    "Netherlands",
+    "Switzerland",
+]
+NON_PERSON_NAME_TERMS = {
+    "about",
+    "author",
+    "books",
+    "collaboration",
+    "contents",
+    "department",
+    "editorial",
+    "educational",
+    "international",
+    "journal",
+    "national",
+    "patterns",
+    "references",
+    "resources",
+    "reviews",
+    "school",
+    "science",
+    "student",
+    "university",
+}
+BAD_PROFILE_ROLE_MARKERS = {"|", "?", "review by", "student page", "about the author", "resources"}
 
 
 def parse_front_matter(text: str) -> dict[str, str]:
@@ -35,6 +107,114 @@ def extract_headings(text: str, limit: int = 8) -> list[str]:
         if len(headings) >= limit:
             break
     return headings
+
+
+def _clean_field_value(key: str, value: str) -> str:
+    value = re.sub(r"\s+", " ", value.strip())
+    value = re.split(r"\b(?:live|retrieved|accessed|pdf)\b", value, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    if key == "country":
+        for country in COUNTRY_NAMES:
+            if value.startswith(country):
+                return country
+    if key in {"chancellor", "vice_chancellor", "president", "dean", "director"}:
+        value = re.split(
+            r"(?=Chancellors\b|Vice-Chancellors\b|Biography\b|Office\b|Profile\b)",
+            value,
+            maxsplit=1,
+        )[0].strip()
+        match = re.match(
+            r"((?:Dr\.?\s+|Prof\.?\s+|Professor\s+)?[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3})",
+            value,
+        )
+        if match:
+            return match.group(1).strip()
+    return value.strip(" .,:;\"'")
+
+
+def extract_key_value_fields(text: str, limit: int = 8) -> list[tuple[str, str]]:
+    fields: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for match in KEY_VALUE_RE.finditer(text):
+        key = match.group(1).strip().lower().replace(" ", "_")
+        value = _clean_field_value(key, match.group(2))
+        if key in seen or key in SKIP_FIELD_KEYS:
+            continue
+        if not (2 <= len(key) <= 40 and 2 <= len(value) <= 160):
+            continue
+        if value.startswith(("http://", "https://", "[[", "{{")):
+            continue
+        fields.append((key, value))
+        seen.add(key)
+    fields.sort(key=lambda item: FIELD_PRIORITY.index(item[0]) if item[0] in FIELD_PRIORITY else len(FIELD_PRIORITY))
+    return fields[:limit]
+
+
+def _humanize_key(key: str) -> str:
+    return key.replace("_", " ").replace("-", " ").strip()
+
+
+def _nonempty_lines(text: str) -> list[str]:
+    return [re.sub(r"\s+", " ", line.strip()) for line in text.splitlines() if line.strip()]
+
+
+def _looks_like_person_heading(name: str) -> bool:
+    if not re.match(r"^(?:Dr|Prof|Professor)\.?\s+", name):
+        return False
+    lowered_parts = {part.lower().strip(".,:-") for part in name.split()}
+    if lowered_parts & NON_PERSON_NAME_TERMS:
+        return False
+    if name.isupper():
+        return False
+    parts = [part for part in name.replace(".", " ").split() if part.lower() not in {"dr", "prof", "professor"}]
+    return 2 <= len(parts) <= 5 and all(part[:1].isupper() for part in parts)
+
+
+def _looks_like_profile_role(role: str) -> bool:
+    lowered = role.lower()
+    if any(marker in lowered for marker in BAD_PROFILE_ROLE_MARKERS):
+        return False
+    if role.startswith(("-", "|")):
+        return False
+    return 4 <= len(role) <= 90
+
+
+def extract_profile_person_tasks(docid: str, url: str, text: str, title: str, *, limit: int = 3) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    matches = list(PERSON_HEADING_RE.finditer(text))
+    for idx, match in enumerate(matches):
+        name = match.group("name").strip()
+        if not _looks_like_person_heading(name):
+            continue
+        block_end = matches[idx + 1].start() if idx + 1 < len(matches) else min(len(text), match.end() + 900)
+        block = text[match.end():block_end]
+        lines = _nonempty_lines(block)
+        if not lines:
+            continue
+        role = next((line for line in lines if _looks_like_profile_role(line) and not line.startswith("(")), "")
+        if not role:
+            continue
+        clue = ""
+        for line in lines[1:]:
+            lowered = line.lower()
+            if any(term in lowered for term in ["earned", "received", "worked", "research", "teaches", "prior work", "degree"]):
+                clue = line
+                break
+        question = f"In the document {title or 'docid ' + docid}, which person is described as {role}?"
+        if clue:
+            question = f"{question} The same profile mentions: {compact_text(clue, max_chars=160)}"
+        tasks.append(
+            _task(
+                docid=docid,
+                url=url,
+                task_type="profile_person",
+                question=question,
+                answer=name,
+                evidence=compact_text(f"{name}\n{block}", max_chars=1200),
+            )
+        )
+        if len(tasks) >= limit:
+            break
+    return tasks
 
 
 def _task(
@@ -107,7 +287,33 @@ def build_tasks_from_document(docid: str, url: str, text: str, *, max_tasks_per_
                 evidence=evidence,
             )
         )
+    for key, value in extract_key_value_fields(text):
+        clue = title or f"docid {docid}"
+        tasks.append(
+            _task(
+                docid=docid,
+                url=url,
+                task_type="infobox_field",
+                question=f"In the document {clue}, what is listed as the {_humanize_key(key)}?",
+                answer=value,
+                evidence=evidence,
+            )
+        )
+        if len(tasks) >= max_tasks_per_doc:
+            break
+    if len(tasks) < max_tasks_per_doc:
+        tasks.extend(
+            extract_profile_person_tasks(
+                docid=docid,
+                url=url,
+                text=text,
+                title=title,
+                limit=max_tasks_per_doc - len(tasks),
+            )
+        )
     for heading in extract_headings(text):
+        if len(tasks) >= max_tasks_per_doc:
+            break
         clue = title or f"docid {docid}"
         tasks.append(
             _task(
@@ -119,8 +325,6 @@ def build_tasks_from_document(docid: str, url: str, text: str, *, max_tasks_per_
                 evidence=evidence,
             )
         )
-        if len(tasks) >= max_tasks_per_doc:
-            break
     return tasks[:max_tasks_per_doc]
 
 
@@ -194,4 +398,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

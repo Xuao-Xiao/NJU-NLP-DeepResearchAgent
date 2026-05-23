@@ -5,6 +5,7 @@ from pathlib import Path
 
 from finetuning.filter_sft_data import filter_records
 from finetuning.evaluate_synthetic import evaluate_predictions
+from finetuning.reweight_sft_data import reweight_records
 from finetuning.synthetic_tasks import build_tasks_from_document
 from finetuning.train import TrainConfig, load_config_file
 from finetuning.trajectory_sft import collect_success_ids, extract_sft_records
@@ -215,6 +216,75 @@ The first chapter describes analytical engines.
         self.assertIn("heading_title", task_types)
         self.assertTrue(all(task["source_docid"] == "doc-1" for task in tasks))
 
+    def test_build_tasks_from_document_creates_infobox_field_tasks(self) -> None:
+        text = """---
+title: Deakin University - Wikipedia
+date: 2004-04-26
+---
+name: Deakin University
+type: Public research university
+country: Australia
+chancellor: John Stanhope
+"""
+
+        tasks = build_tasks_from_document(docid="20509", url="https://example.test", text=text, max_tasks_per_doc=8)
+
+        field_tasks = [task for task in tasks if task["task_type"] == "infobox_field"]
+        self.assertTrue(any(task["answer"] == "Australia" for task in field_tasks))
+        self.assertTrue(any("listed as the country" in task["question"] for task in field_tasks))
+
+    def test_build_tasks_from_document_cleans_noisy_infobox_values(self) -> None:
+        text = """---
+title: Deakin University - Wikipedia
+---
+country: AustraliaMelbourne Burwood live 26 September 2024 Deakin University en-AU Melbourne
+chancellor: John StanhopeChancellors and Vice-Chancellors live 25 September 2024 Deakin University
+"""
+
+        tasks = build_tasks_from_document(docid="20509", url="https://example.test", text=text, max_tasks_per_doc=8)
+
+        answers = {task["question"]: task["answer"] for task in tasks if task["task_type"] == "infobox_field"}
+        self.assertIn("Australia", answers.values())
+        self.assertIn("John Stanhope", answers.values())
+
+    def test_build_tasks_from_document_creates_profile_person_tasks(self) -> None:
+        text = """---
+title: HSTM Faculty/Staff
+---
+Dr. Robert Mathner
+
+Associate Director & Professor
+
+Dr. Robert Mathner received a Ph.D. in Physical Education from The Florida State University.
+His prior work experience includes working in athletics departments at UCF and Syracuse University.
+"""
+
+        tasks = build_tasks_from_document(docid="69841", url="https://example.test", text=text, max_tasks_per_doc=8)
+
+        profile_tasks = [task for task in tasks if task["task_type"] == "profile_person"]
+        self.assertTrue(profile_tasks)
+        self.assertEqual(profile_tasks[0]["answer"], "Dr. Robert Mathner")
+        self.assertIn("Associate Director", profile_tasks[0]["question"])
+
+    def test_build_tasks_from_document_rejects_non_person_profile_headings(self) -> None:
+        text = """---
+title: Resources
+---
+Editorial Reviews
+
+About the Author
+
+For the past 25 years, Mardie has researched and taught in health promotion.
+
+Educational Resources
+
+- Student Page - An online resource for students.
+"""
+
+        tasks = build_tasks_from_document(docid="r1", url="https://example.test", text=text, max_tasks_per_doc=8)
+
+        self.assertFalse(any(task["task_type"] == "profile_person" for task in tasks))
+
     def test_evaluate_predictions_matches_synthetic_answers_by_query_id(self) -> None:
         tasks = [
             {"id": "task-1", "answer": "Example Book"},
@@ -252,6 +322,27 @@ The first chapter describes analytical engines.
             self.assertIsInstance(config, TrainConfig)
             self.assertEqual(config.learning_rate, 5e-5)
             self.assertEqual(config.lora_rank, 16)
+
+    def test_reweight_records_boosts_matching_source_and_task_with_unique_ids(self) -> None:
+        rows = [
+            {"id": "a", "source": "OTEasyRun0.11_22/multistep_submission.jsonl", "task_type": "query_rewrite"},
+            {"id": "b", "source": "synthetic.jsonl", "task_type": "final_answer"},
+            {"id": "c", "source": "synthetic.jsonl", "task_type": "query_rewrite"},
+        ]
+
+        weighted = list(
+            reweight_records(
+                rows,
+                source_boosts={"OTEasyRun0.11_22": 3},
+                task_boosts={"final_answer": 2},
+            )
+        )
+
+        ids = [row["id"] for row in weighted]
+        self.assertEqual(len(ids), 6)
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(sum(1 for row in weighted if row["id"].startswith("a")), 3)
+        self.assertEqual(sum(1 for row in weighted if row["id"].startswith("b")), 2)
 
 
 if __name__ == "__main__":
