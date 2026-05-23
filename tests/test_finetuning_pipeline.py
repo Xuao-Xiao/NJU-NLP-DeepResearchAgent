@@ -83,6 +83,83 @@ class FineTuningPipelineTests(unittest.TestCase):
                 },
             )
 
+    def test_extract_sft_records_emits_finish_and_final_answer_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            submission_path = Path(tmpdir) / "submission.jsonl"
+            eval_path = Path(tmpdir) / "eval.jsonl"
+            write_jsonl(eval_path, [{"query_id": "5", "eval_judgment": "CORRECT"}])
+            state = {
+                "question": "Who is the cover designer?",
+                "question_plan": {
+                    "answer_type": "person",
+                    "keywords": ["cover designer"],
+                },
+                "confirmed_facts": ["Cristina Ortiz is the cover designer."],
+                "candidate_answers": ["Cristina Ortiz"],
+                "opened_passages": ["Cristina Ortiz Graphic Designer"],
+                "search_evidence": [],
+                "verification_results": [
+                    {
+                        "candidate_answer": "Cristina Ortiz",
+                        "supported": True,
+                        "support_score": 0.9,
+                    }
+                ],
+                "candidate_records": [],
+            }
+            write_jsonl(
+                submission_path,
+                [
+                    {
+                        "query_id": "5",
+                        "predicted_answer": "Cristina Ortiz",
+                        "agent_state": state,
+                        "messages": [
+                            {"role": "system", "content": "System prompt"},
+                            {"role": "user", "content": "Who is the cover designer?"},
+                            {
+                                "role": "assistant",
+                                "content": "Heuristic policy selected finish after candidate verification.",
+                                "state_summary": "Question: Who is the cover designer?\nVerifier results:\nCristina Ortiz supported=True",
+                                "action_plan": {
+                                    "action": "finish",
+                                    "answer_hint": "Cristina Ortiz",
+                                    "reason": "Opened evidence supports the candidate.",
+                                },
+                            },
+                            {
+                                "role": "assistant",
+                                "content": "{\"exact_answer\":\"Cristina Ortiz\",\"confidence\":0.9,\"support\":\"Verified by opened evidence.\"}",
+                                "state_summary": "Question: Who is the cover designer?",
+                                "finish_reason": "model_or_fallback_finish",
+                            },
+                        ],
+                    }
+                ],
+            )
+
+            records = list(
+                extract_sft_records(
+                    submission_path,
+                    eval_path=eval_path,
+                    include_final_answer=True,
+                )
+            )
+
+            self.assertEqual([record["task_type"] for record in records], ["finish_decision", "final_answer"])
+            self.assertEqual(
+                json.loads(records[0]["messages"][-1]["content"]),
+                {
+                    "action": "finish",
+                    "answer_hint": "Cristina Ortiz",
+                    "reason": "Opened evidence supports the candidate.",
+                },
+            )
+            self.assertEqual(
+                json.loads(records[1]["messages"][-1]["content"])["exact_answer"],
+                "Cristina Ortiz",
+            )
+
     def test_filter_records_rejects_invalid_json_action_and_think_output(self) -> None:
         rows = [
             {

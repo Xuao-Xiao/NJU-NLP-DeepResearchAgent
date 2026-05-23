@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any, Iterator
 
+from agent.multistep_agent import FINAL_ANSWER_SYSTEM_PROMPT, _build_final_user_prompt
+
 from .common import compact_text, normalize_judgment, read_jsonl, safe_json_loads, stable_id, write_jsonl
 
 
@@ -78,6 +80,64 @@ def _action_from_tool_call(tool_call: dict[str, Any], assistant_content: str) ->
     return action
 
 
+def _action_from_finish_message(message: dict[str, Any]) -> dict[str, Any] | None:
+    action_plan = message.get("action_plan")
+    if isinstance(action_plan, dict):
+        action = dict(action_plan)
+    else:
+        action = safe_json_loads(message.get("content", ""))
+    if str(action.get("action", "")).strip() != "finish":
+        return None
+    reason = compact_text(action.get("reason") or message.get("content", ""), max_chars=240)
+    return {
+        "action": "finish",
+        "answer_hint": compact_text(action.get("answer_hint", ""), max_chars=200),
+        "reason": reason or "Stop because opened evidence supports the current candidate answer.",
+    }
+
+
+def _final_answer_content(row: dict[str, Any]) -> str:
+    messages = row.get("messages", [])
+    if isinstance(messages, list):
+        for message in reversed(messages):
+            if message.get("role") != "assistant":
+                continue
+            raw_content = str(message.get("content", ""))
+            if "<think>" in raw_content.lower():
+                continue
+            parsed = safe_json_loads(raw_content)
+            exact = compact_text(parsed.get("exact_answer", ""), max_chars=300)
+            if exact:
+                payload = {
+                    "exact_answer": exact,
+                    "confidence": parsed.get("confidence", 0),
+                    "support": compact_text(parsed.get("support", "Verified by trajectory evidence."), max_chars=300),
+                }
+                return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    predicted = compact_text(row.get("predicted_answer", ""), max_chars=300)
+    if predicted and "<think>" not in predicted.lower():
+        payload = {
+            "exact_answer": predicted,
+            "confidence": 0,
+            "support": "Trajectory top-level predicted answer.",
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return ""
+
+
+def _build_final_answer_user_content(question: str, row: dict[str, Any], max_chars: int) -> str:
+    state = row.get("agent_state")
+    if isinstance(state, dict):
+        try:
+            return compact_text(_build_final_user_prompt(question=question, state=state), max_chars=max_chars)
+        except Exception:
+            pass
+    return compact_text(
+        "\n".join([f"Question:\n{question}", "", "Give the final answer now."]),
+        max_chars=max_chars,
+    )
+
+
 def _build_user_content(
     question: str,
     state_summary: str,
@@ -122,9 +182,10 @@ def extract_sft_records(
             if message.get("role") != "assistant":
                 continue
             tool_calls = message.get("tool_calls") or []
-            if not isinstance(tool_calls, list) or not tool_calls:
-                continue
-            action = _action_from_tool_call(tool_calls[0], str(message.get("content", "")))
+            if isinstance(tool_calls, list) and tool_calls:
+                action = _action_from_tool_call(tool_calls[0], str(message.get("content", "")))
+            else:
+                action = _action_from_finish_message(message)
             if action is None:
                 continue
             task_type = ACTION_TASK_TYPES.get(str(action.get("action")), "action_decision")
@@ -157,10 +218,10 @@ def extract_sft_records(
                 ],
             }
         if include_final_answer:
-            predicted = compact_text(row.get("predicted_answer", ""), max_chars=300)
-            if predicted and "<think>" not in predicted.lower():
+            final_content = _final_answer_content(row)
+            if final_content:
                 yield {
-                    "id": stable_id(submission_path, query_id, "final", predicted, prefix="sft"),
+                    "id": stable_id(submission_path, query_id, "final", final_content, prefix="sft"),
                     "task_type": "final_answer",
                     "source": str(submission_path),
                     "source_query_id": query_id,
@@ -169,9 +230,16 @@ def extract_sft_records(
                         "from_correct_trajectory": judgments.get(query_id) == "CORRECT" if judgments else None,
                     },
                     "messages": [
-                        {"role": "system", "content": "Return only the final short answer supported by evidence."},
-                        {"role": "user", "content": f"Question:\n{question}\n\nReturn the final short answer only."},
-                        {"role": "assistant", "content": predicted},
+                        {"role": "system", "content": FINAL_ANSWER_SYSTEM_PROMPT},
+                        {
+                            "role": "user",
+                            "content": _build_final_answer_user_content(
+                                question=question,
+                                row=row,
+                                max_chars=max_user_chars,
+                            ),
+                        },
+                        {"role": "assistant", "content": final_content},
                     ],
                 }
 
@@ -200,4 +268,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
