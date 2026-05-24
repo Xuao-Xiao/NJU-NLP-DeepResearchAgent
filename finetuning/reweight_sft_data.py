@@ -30,15 +30,23 @@ def _copy_with_id(row: dict[str, Any], copy_index: int) -> dict[str, Any]:
     return copied
 
 
-def _multiplier(row: dict[str, Any], source_boosts: dict[str, int], task_boosts: dict[str, int]) -> int:
+def _multiplier(
+    row: dict[str, Any],
+    source_boosts: dict[str, int],
+    task_boosts: dict[str, int],
+    query_id_boosts: dict[str, int],
+) -> int:
     multiplier = 1
     source = str(row.get("source", ""))
     task_type = str(row.get("task_type", ""))
+    source_query_id = str(row.get("source_query_id", ""))
     for needle, value in source_boosts.items():
         if needle in source:
             multiplier = max(multiplier, value)
     if task_type in task_boosts:
         multiplier = max(multiplier, task_boosts[task_type])
+    if source_query_id in query_id_boosts:
+        multiplier = max(multiplier, query_id_boosts[source_query_id])
     return multiplier
 
 
@@ -47,11 +55,13 @@ def reweight_records(
     *,
     source_boosts: dict[str, int] | None = None,
     task_boosts: dict[str, int] | None = None,
+    query_id_boosts: dict[str, int] | None = None,
 ) -> Iterator[dict[str, Any]]:
     source_boosts = source_boosts or {}
     task_boosts = task_boosts or {}
+    query_id_boosts = query_id_boosts or {}
     for row in rows:
-        for copy_index in range(_multiplier(row, source_boosts, task_boosts)):
+        for copy_index in range(_multiplier(row, source_boosts, task_boosts, query_id_boosts)):
             yield _copy_with_id(row, copy_index)
 
 
@@ -71,6 +81,12 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Task multiplier, for example final_answer=2",
     )
+    parser.add_argument(
+        "--boost-query-id",
+        action="append",
+        default=[],
+        help="source_query_id multiplier, for example 556=8",
+    )
     return parser.parse_args()
 
 
@@ -82,6 +98,7 @@ def main() -> None:
             read_jsonl(args.input),
             source_boosts=parse_boosts(args.boost_source),
             task_boosts=parse_boosts(args.boost_task),
+            query_id_boosts=parse_boosts(args.boost_query_id),
         ),
     )
     print(f"Wrote {count} reweighted records to {args.output}")

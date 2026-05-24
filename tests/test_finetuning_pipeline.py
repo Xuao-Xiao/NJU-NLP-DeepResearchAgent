@@ -9,6 +9,7 @@ from finetuning.reweight_sft_data import reweight_records
 from finetuning.synthetic_tasks import build_tasks_from_document
 from finetuning.train import TrainConfig, load_config_file
 from finetuning.trajectory_sft import collect_success_ids, extract_sft_records
+from finetuning.v3_contrast_sft import build_contrast_records
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -343,6 +344,62 @@ Educational Resources
         self.assertEqual(len(ids), len(set(ids)))
         self.assertEqual(sum(1 for row in weighted if row["id"].startswith("a")), 3)
         self.assertEqual(sum(1 for row in weighted if row["id"].startswith("b")), 2)
+
+    def test_reweight_records_boosts_matching_source_query_id(self) -> None:
+        rows = [
+            {"id": "a", "source": "run.jsonl", "source_query_id": "556", "task_type": "query_rewrite"},
+            {"id": "b", "source": "run.jsonl", "source_query_id": "651", "task_type": "final_answer"},
+            {"id": "c", "source": "run.jsonl", "source_query_id": "5", "task_type": "query_rewrite"},
+        ]
+
+        weighted = list(reweight_records(rows, query_id_boosts={"556": 4, "651": 3}))
+
+        ids = [row["id"] for row in weighted]
+        self.assertEqual(len(ids), 8)
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(sum(1 for row in weighted if row["id"].startswith("a")), 4)
+        self.assertEqual(sum(1 for row in weighted if row["id"].startswith("b")), 3)
+        self.assertEqual(sum(1 for row in weighted if row["id"].startswith("c")), 1)
+
+    def test_build_contrast_records_creates_v3_hardening_samples(self) -> None:
+        tasks = [
+            {
+                "id": "synthetic-a",
+                "task_type": "infobox_field",
+                "source_docid": "100",
+                "question": "In the document Example University, what is listed as the country?",
+                "answer": "Australia",
+                "evidence": "title: Example University\ncountry: Australia\ntype: Public university",
+            },
+            {
+                "id": "synthetic-b",
+                "task_type": "infobox_field",
+                "source_docid": "200",
+                "question": "In the document Other University, what is listed as the country?",
+                "answer": "Canada",
+                "evidence": "title: Other University\ncountry: Canada\ntype: Public university",
+            },
+        ]
+
+        records = list(build_contrast_records(tasks, max_source_tasks=1))
+
+        self.assertEqual(
+            [record["task_type"] for record in records],
+            [
+                "doc_selection",
+                "query_rewrite",
+                "document_find",
+                "candidate_verification",
+                "finish_decision",
+                "final_answer",
+            ],
+        )
+        self.assertEqual(json.loads(records[0]["messages"][-1]["content"])["action"], "get_document")
+        self.assertEqual(json.loads(records[1]["messages"][-1]["content"])["action"], "search")
+        self.assertEqual(json.loads(records[2]["messages"][-1]["content"])["action"], "find_in_document")
+        self.assertEqual(json.loads(records[3]["messages"][-1]["content"])["action"], "verify_claim")
+        self.assertEqual(json.loads(records[4]["messages"][-1]["content"])["action"], "finish")
+        self.assertEqual(json.loads(records[5]["messages"][-1]["content"])["exact_answer"], "Australia")
 
 
 if __name__ == "__main__":
