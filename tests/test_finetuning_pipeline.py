@@ -203,12 +203,24 @@ class FineTuningPipelineTests(unittest.TestCase):
                     },
                 ],
             },
+            {
+                "id": "alphabet-index",
+                "task_type": "candidate_verification",
+                "messages": [
+                    {"role": "system", "content": "s"},
+                    {"role": "user", "content": "u"},
+                    {
+                        "role": "assistant",
+                        "content": "{\"action\":\"verify_claim\",\"candidate_answer\":\"A B C D E F G H I J K L M N O P Q R S T U V W X Y Z\"}",
+                    },
+                ],
+            },
         ]
 
         kept, rejected = filter_records(rows)
 
         self.assertEqual([row["id"] for row in kept], ["ok"])
-        self.assertEqual({row["id"] for row, _ in rejected}, {"bad-json", "think", "empty-finish"})
+        self.assertEqual({row["id"] for row, _ in rejected}, {"bad-json", "think", "empty-finish", "alphabet-index"})
 
     def test_build_tasks_from_document_creates_metadata_and_heading_tasks(self) -> None:
         text = """---

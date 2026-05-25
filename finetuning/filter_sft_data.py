@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -18,6 +19,14 @@ ACTION_TASK_TYPES = {
     "finish_decision",
     "action_decision",
 }
+
+
+def _looks_like_alphabet_index(candidate: str) -> bool:
+    tokens = candidate.strip().split()
+    if len(tokens) < 8:
+        return False
+    single_letters = [token for token in tokens if re.fullmatch(r"[A-Z]", token)]
+    return len(single_letters) / len(tokens) >= 0.75
 
 
 def rejection_reason(row: dict[str, Any], *, max_user_chars: int = 8000, max_assistant_chars: int = 1000) -> str | None:
@@ -48,6 +57,12 @@ def rejection_reason(row: dict[str, Any], *, max_user_chars: int = 8000, max_ass
             return "missing_search_query"
         if str(action.get("action")) == "get_document" and not str(action.get("docid", "")).strip():
             return "missing_docid"
+        if str(action.get("action")) == "verify_claim":
+            candidate = str(action.get("candidate_answer", "")).strip()
+            if not candidate:
+                return "missing_candidate_answer"
+            if _looks_like_alphabet_index(candidate):
+                return "alphabet_index_candidate"
         if str(action.get("action")) == "finish" and not str(action.get("answer_hint", "")).strip():
             return "empty_finish_answer_hint"
     elif task_type == "final_answer":
