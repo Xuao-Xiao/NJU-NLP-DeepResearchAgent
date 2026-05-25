@@ -191,12 +191,24 @@ class FineTuningPipelineTests(unittest.TestCase):
                     {"role": "assistant", "content": "<think>hidden</think>Answer"},
                 ],
             },
+            {
+                "id": "empty-finish",
+                "task_type": "finish_decision",
+                "messages": [
+                    {"role": "system", "content": "s"},
+                    {"role": "user", "content": "u"},
+                    {
+                        "role": "assistant",
+                        "content": "{\"action\":\"finish\",\"answer_hint\":\"\",\"reason\":\"stop at final round\"}",
+                    },
+                ],
+            },
         ]
 
         kept, rejected = filter_records(rows)
 
         self.assertEqual([row["id"] for row in kept], ["ok"])
-        self.assertEqual({row["id"] for row, _ in rejected}, {"bad-json", "think"})
+        self.assertEqual({row["id"] for row, _ in rejected}, {"bad-json", "think", "empty-finish"})
 
     def test_build_tasks_from_document_creates_metadata_and_heading_tasks(self) -> None:
         text = """---

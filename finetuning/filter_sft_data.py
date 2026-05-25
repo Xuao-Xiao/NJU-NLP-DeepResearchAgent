@@ -48,6 +48,8 @@ def rejection_reason(row: dict[str, Any], *, max_user_chars: int = 8000, max_ass
             return "missing_search_query"
         if str(action.get("action")) == "get_document" and not str(action.get("docid", "")).strip():
             return "missing_docid"
+        if str(action.get("action")) == "finish" and not str(action.get("answer_hint", "")).strip():
+            return "empty_finish_answer_hint"
     elif task_type == "final_answer":
         if not str(assistant.get("content", "")).strip():
             return "empty_final_answer"
