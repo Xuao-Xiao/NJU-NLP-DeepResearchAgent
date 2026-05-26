@@ -659,9 +659,6 @@ def _candidate_looks_wrong_type(candidate: str, expected_type: str) -> bool:
             "supervisory", "committee", "supervisor", "research supervisor",
             "graduate", "studies", "funding", "access", "investigation",
             "doctoral degree", "doctoral thesis", "major research paper", "portfolio thesis",
-            "bachelor", "bachelor's", "master", "master's", "degree", "biology",
-            "science", "sciences", "management", "publishing", "business",
-            "leadership", "strategies",
         }
         if candidate_for_shape.isupper():
             return True
@@ -2093,70 +2090,6 @@ def _should_stop_after_state_update(state: Dict[str, Any], max_rounds: int, roun
     return None
 
 
-def _apply_final_answer_guard(predicted_answer: str, state: Dict[str, Any]) -> str:
-    question_plan = state.get("question_plan", {})
-    expected_type = question_plan.get("answer_type", "other")
-    predicted_answer = _normalize_answer_to_type(predicted_answer or "", expected_type)
-    supported_candidate = _select_supported_verified_candidate(state)
-    if supported_candidate:
-        if _normalize_query(predicted_answer) != _normalize_query(supported_candidate):
-            state["final_answer_guard"] = "supported_verified_candidate"
-        return supported_candidate
-
-    best_candidate = _select_best_candidate(state)
-    recorded_candidate = _select_best_recorded_candidate(state)
-    if best_candidate:
-        predicted_score = _candidate_evidence_score(predicted_answer, state)
-        best_score = _candidate_evidence_score(best_candidate, state)
-        recorded_score = _candidate_evidence_score(recorded_candidate, state) if recorded_candidate else -100.0
-        preferred_candidate = best_candidate
-        force_preferred_candidate = False
-        best_record_count = _candidate_record_frequency(best_candidate, state)
-        predicted_record_count = _candidate_record_frequency(predicted_answer, state)
-        preferred_record_count = _candidate_record_frequency(preferred_candidate, state)
-        recorded_record_count = _candidate_record_frequency(recorded_candidate, state)
-        if (
-            expected_type == "company"
-            and recorded_candidate
-            and recorded_record_count >= 2
-            and preferred_record_count == 0
-            and predicted_record_count == 0
-            and recorded_score >= max(best_score, predicted_score) - 8.0
-        ):
-            preferred_candidate = recorded_candidate
-            best_score = recorded_score
-            best_record_count = recorded_record_count
-            force_preferred_candidate = True
-        if (
-            force_preferred_candidate
-            or not predicted_answer
-            or _is_placeholder_answer(predicted_answer)
-            or _looks_like_reasoning_answer(predicted_answer)
-            or _candidate_looks_wrong_type(predicted_answer, expected_type)
-            or (
-                expected_type == "company"
-                and preferred_candidate == best_candidate
-                and best_record_count >= 2
-                and predicted_record_count == 0
-                and best_score >= predicted_score + 3.0
-            )
-            or (preferred_candidate == best_candidate and best_score >= predicted_score + 6.0)
-            or best_score >= predicted_score + 10.0
-        ):
-            predicted_answer = preferred_candidate
-
-    if expected_type == "company" and recorded_candidate:
-        final_predicted_count = _candidate_record_frequency(predicted_answer, state)
-        final_recorded_count = _candidate_record_frequency(recorded_candidate, state)
-        if final_predicted_count == 0 and final_recorded_count >= 2:
-            final_predicted_score = _candidate_evidence_score(predicted_answer, state)
-            final_recorded_score = _candidate_evidence_score(recorded_candidate, state)
-            if final_recorded_score >= final_predicted_score - 12.0:
-                predicted_answer = recorded_candidate
-                state["final_answer_guard"] = "recorded_company_candidate"
-    return _normalize_answer_to_type(predicted_answer or "", expected_type)
-
-
 def _init_state(question: str, question_plan: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "question": question,
@@ -2665,9 +2598,6 @@ def _pick_unopened_docid(state: Dict[str, Any]) -> str:
 
 
 def _has_supported_answer_candidate(state: Dict[str, Any]) -> Tuple[bool, str]:
-    supported_candidate = _select_supported_verified_candidate(state)
-    if supported_candidate:
-        return True, supported_candidate
     candidate = _select_best_candidate(state)
     if not candidate:
         return False, ""
@@ -2708,7 +2638,7 @@ def _decide_next_action(
         }, "Heuristic policy selected get_document after search."
 
     supported, best_candidate = _has_supported_answer_candidate(state)
-    if supported and round_id >= 3:
+    if supported and round_id >= 5:
         return {
             "action": "finish",
             "answer_hint": best_candidate,
@@ -3295,7 +3225,64 @@ def run_multistep_agent(
     if _looks_like_reasoning_answer(predicted_answer) and extracted_candidates:
         predicted_answer = extracted_candidates[0]
     predicted_answer = _normalize_answer_to_type(predicted_answer or "", question_plan.get("answer_type", "other"))
-    predicted_answer = _apply_final_answer_guard(predicted_answer, state)
+    supported_candidate = _select_supported_verified_candidate(state)
+    best_candidate = _select_best_candidate(state)
+    recorded_candidate = _select_best_recorded_candidate(state)
+    if best_candidate:
+        predicted_score = _candidate_evidence_score(predicted_answer, state)
+        best_score = _candidate_evidence_score(best_candidate, state)
+        supported_score = _candidate_evidence_score(supported_candidate, state) if supported_candidate else -100.0
+        recorded_score = _candidate_evidence_score(recorded_candidate, state) if recorded_candidate else -100.0
+        expected_type = question_plan.get("answer_type", "other")
+        preferred_candidate = supported_candidate
+        force_preferred_candidate = False
+        if not preferred_candidate or best_score >= supported_score + 8.0:
+            preferred_candidate = best_candidate
+        best_record_count = _candidate_record_frequency(best_candidate, state)
+        predicted_record_count = _candidate_record_frequency(predicted_answer, state)
+        preferred_record_count = _candidate_record_frequency(preferred_candidate, state)
+        recorded_record_count = _candidate_record_frequency(recorded_candidate, state)
+        if (
+            expected_type == "company"
+            and recorded_candidate
+            and recorded_record_count >= 2
+            and preferred_record_count == 0
+            and predicted_record_count == 0
+            and recorded_score >= max(best_score, predicted_score) - 8.0
+        ):
+            preferred_candidate = recorded_candidate
+            best_score = recorded_score
+            best_record_count = recorded_record_count
+            force_preferred_candidate = True
+        if (
+            force_preferred_candidate
+            or bool(preferred_candidate and preferred_candidate == supported_candidate)
+            or not predicted_answer
+            or _is_placeholder_answer(predicted_answer)
+            or _looks_like_reasoning_answer(predicted_answer)
+            or _candidate_looks_wrong_type(predicted_answer, expected_type)
+            or (
+                expected_type == "company"
+                and preferred_candidate == best_candidate
+                and best_record_count >= 2
+                and predicted_record_count == 0
+                and best_score >= predicted_score + 3.0
+            )
+            or (preferred_candidate == best_candidate and best_score >= predicted_score + 6.0)
+            or best_score >= predicted_score + 10.0
+        ):
+            predicted_answer = preferred_candidate
+    final_expected_type = question_plan.get("answer_type", "other")
+    final_recorded_candidate = _select_best_recorded_candidate(state)
+    if final_expected_type == "company" and final_recorded_candidate:
+        final_predicted_count = _candidate_record_frequency(predicted_answer, state)
+        final_recorded_count = _candidate_record_frequency(final_recorded_candidate, state)
+        if final_predicted_count == 0 and final_recorded_count >= 2:
+            final_predicted_score = _candidate_evidence_score(predicted_answer, state)
+            final_recorded_score = _candidate_evidence_score(final_recorded_candidate, state)
+            if final_recorded_score >= final_predicted_score - 12.0:
+                predicted_answer = final_recorded_candidate
+                state["final_answer_guard"] = "recorded_company_candidate"
     state["candidate_answers"].append(predicted_answer or final_text[:200])
 
     messages.append(
